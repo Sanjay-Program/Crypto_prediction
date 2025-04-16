@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cryptocurrency Price Predictor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 20px;
+      background-color: #f4f4f9;
+    }
+    h1 {
+      color: #333;
+    }
+    input, button {
+      padding: 10px;
+      margin: 10px 0;
+      font-size: 16px;
+    }
+    button {
+      cursor: pointer;
+      background-color: #4caf50;
+      color: white;
+      border: none;
+      border-radius: 5px;
+    }
+    canvas {
+      max-width: 100%;
+      height: 400px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Cryptocurrency Price Predictor</h1>
+  <input type="text" id="crypto-symbol" placeholder="Enter Crypto Symbol (e.g., BTC-USD)">
+  <button onclick="fetchCryptoPredictions()">Predict Prices</button>
+
+  <canvas id="cryptoChart"></canvas>
+
+  <script>
+    async function fetchCryptoPredictions() {
+      const symbol = document.getElementById("crypto-symbol").value;
+      if (!symbol) {
+        alert("Please enter a cryptocurrency symbol.");
+        return;
+      }
+
+      try {
+        const response = await fetch("http://127.0.0.1:5000/predict/crypto", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ symbol: symbol })
+        });
+
+        if (!response.ok) {
+          throw new Error("Failed to fetch predictions.");
+        }
+
+        const data = await response.json();
+        const predictions = data.predictions;
+
+        // Plot predictions on the chart
+        const ctx = document.getElementById("cryptoChart").getContext("2d");
+        new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: predictions.map((_, index) => `Day ${index + 1}`),
+            datasets: [{
+              label: "Predicted Prices",
+              data: predictions,
+              borderColor: "#4caf50",
+              borderWidth: 2,
+              fill: false
+            }]
+          },
+          options: {
+            responsive: true,
+            scales: {
+              x: { display: true, title: { display: true, text: "Days" } },
+              y: { display: true, title: { display: true, text: "Price (USD)" } }
+            }
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching predictions:", error);
+      }
+    }
+  </script>
+</body>
+</html>
