@@ -21,3 +21,28 @@ Technologies Used
 - Git (Version Control)
 
 
+## AURA-X PRIME (Phase 1 Implemented)
+
+This repository now includes a Phase 1 Rust ingestion core at:
+
+- `/home/runner/work/Crypto_prediction/Crypto_prediction/aura_x_prime_ingestion`
+
+### What it includes
+
+- Tokio async runtime based ingestion engine
+- Parallel source ingestion with task fan-out (`tokio::task::JoinSet`)
+- Source catalog sized to 100+ logical sources (stocks, crypto, news, social, macro)
+- WebSocket ingestion via `tokio-tungstenite`
+- HTTP/HTML ingestion via `reqwest` + `scraper`
+- Retry with exponential backoff
+- Per-source lightweight rate limiting
+- Header rotation using rotating User-Agent headers
+
+### Run
+
+```bash
+cd /home/runner/work/Crypto_prediction/Crypto_prediction/aura_x_prime_ingestion
+cargo run
+```
+
+> Note: some external endpoints can rate-limit or require API keys; failures are logged per source and do not crash the full ingestion batch.
