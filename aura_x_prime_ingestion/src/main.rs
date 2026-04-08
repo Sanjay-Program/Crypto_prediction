@@ -1172,13 +1172,14 @@ fn source_websocket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const FIXED_TEST_TS_MS: i64 = 1_700_000_000_000;
 
     fn test_event(payload: serde_json::Value) -> UnifiedStreamEvent {
         UnifiedStreamEvent {
             source: "binance_btcusdt_trade".to_string(),
             category: "crypto".to_string(),
             normalized_type: "websocket".to_string(),
-            ingest_ts_ms: 1_700_000_000_000,
+            ingest_ts_ms: FIXED_TEST_TS_MS,
             payload_json: serde_json::to_vec(&payload).expect("json payload encoding should work"),
         }
     }

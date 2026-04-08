@@ -28,8 +28,10 @@ RUST_SIGNAL_SUMMARY_PATH = os.getenv(
 )
 
 MODEL_CACHE_MAX_SIZE = 8
-MODEL_CACHE_TTL_SECONDS = 30 * 60
+MODEL_CACHE_TTL_MINUTES = 30
+MODEL_CACHE_TTL_SECONDS = MODEL_CACHE_TTL_MINUTES * 60
 PROTO_CACHE_TTL_SECONDS = 60
+EPSILON = 1e-9
 
 _model_cache = {}
 _model_cache_lock = threading.Lock()
@@ -76,8 +78,8 @@ def _cache_key(symbol, lookback_days, sequence_length, epochs, batch_size):
 
 def _evict_model_cache_if_needed():
     while len(_model_cache) > MODEL_CACHE_MAX_SIZE:
-        oldest_key = min(_model_cache, key=lambda k: _model_cache[k]["created_at"])
-        _model_cache.pop(oldest_key, None)
+        lru_key = min(_model_cache, key=lambda k: _model_cache[k]["last_used_at"])
+        _model_cache.pop(lru_key, None)
 
 
 def _get_cached_model(cache_key):
@@ -379,7 +381,7 @@ def _compute_test_metrics(actual, predicted):
     residuals = actual - predicted
     rmse = float(np.sqrt(np.mean(np.square(residuals))))
 
-    denom = np.where(np.abs(actual) < 1e-9, 1e-9, np.abs(actual))
+    denom = np.where(np.abs(actual) < EPSILON, EPSILON, np.abs(actual))
     mape = float(np.mean(np.abs((actual - predicted) / denom)) * 100.0)
 
     return {
