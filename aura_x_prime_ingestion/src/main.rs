@@ -266,9 +266,12 @@ async fn main() -> Result<()> {
         market_rx,
         "output/aura_market_features.pb",
     ));
-    let signal_engine_task = tokio::spawn(run_signal_engine_stage(market_signal_input_rx, signal_tx));
-    let signal_storage_task =
-        tokio::spawn(run_signal_storage_stage(signal_rx, "output/aura_market_signals.pb"));
+    let signal_engine_task =
+        tokio::spawn(run_signal_engine_stage(market_signal_input_rx, signal_tx));
+    let signal_storage_task = tokio::spawn(run_signal_storage_stage(
+        signal_rx,
+        "output/aura_market_signals.pb",
+    ));
 
     let mut jobs = JoinSet::new();
     for source in sources {
