@@ -63,3 +63,20 @@ The Rust module now includes a lightweight stream-processing pipeline using Toki
 ### Optional environment variables
 
 - `FRED_API_KEY` (optional): used for FRED macro API requests when provided
+
+## AURA-X PRIME (Phase 3 Implemented)
+
+A market feature engine now runs after normalization to generate compact candle/indicator records.
+
+### Phase 3 pipeline
+
+- `ingestion -> processing -> stream storage`
+- `processing -> market engine -> market feature storage`
+- Market engine computes per-source:
+  - Candle-like fields (`open`, `high`, `low`, `close`, `volume`)
+  - Indicators (`ema_fast`, `ema_slow`, `rsi14`, `momentum`)
+
+### Phase 3 output
+
+- Output file: `aura_x_prime_ingestion/output/aura_market_features.pb`
+- Format: length-delimited Protobuf market feature stream

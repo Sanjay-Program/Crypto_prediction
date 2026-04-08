@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -35,6 +36,9 @@ const HTML_RETRY_ATTEMPTS: usize = 4;
 const HTML_INITIAL_BACKOFF_MS: u64 = 500;
 const WS_RETRY_ATTEMPTS: usize = 3;
 const WS_INITIAL_BACKOFF_MS: u64 = 600;
+const EMA_FAST_PERIOD: f64 = 5.0;
+const EMA_SLOW_PERIOD: f64 = 14.0;
+const RSI_PERIOD: usize = 14;
 
 #[derive(Clone, Debug)]
 enum SourceKind {
@@ -79,6 +83,43 @@ struct UnifiedStreamEvent {
     ingest_ts_ms: i64,
     #[prost(bytes = "vec", tag = "5")]
     payload_json: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MarketFeatureRecord {
+    #[prost(string, tag = "1")]
+    source: String,
+    #[prost(string, tag = "2")]
+    category: String,
+    #[prost(int64, tag = "3")]
+    feature_ts_ms: i64,
+    #[prost(double, tag = "4")]
+    open: f64,
+    #[prost(double, tag = "5")]
+    high: f64,
+    #[prost(double, tag = "6")]
+    low: f64,
+    #[prost(double, tag = "7")]
+    close: f64,
+    #[prost(double, tag = "8")]
+    volume: f64,
+    #[prost(double, tag = "9")]
+    ema_fast: f64,
+    #[prost(double, tag = "10")]
+    ema_slow: f64,
+    #[prost(double, tag = "11")]
+    rsi14: f64,
+    #[prost(double, tag = "12")]
+    momentum: f64,
+}
+
+#[derive(Debug, Default)]
+struct MarketSeriesState {
+    prev_close: Option<f64>,
+    ema_fast: Option<f64>,
+    ema_slow: Option<f64>,
+    gains: VecDeque<f64>,
+    losses: VecDeque<f64>,
 }
 
 #[derive(Debug)]
@@ -178,14 +219,26 @@ async fn main() -> Result<()> {
     };
 
     let (ingestion_tx, ingestion_rx) = mpsc::channel::<IngestionEnvelope>(CHANNEL_BUFFER_SIZE);
-    let (processing_tx, processing_rx) = mpsc::channel::<UnifiedStreamEvent>(CHANNEL_BUFFER_SIZE);
+    let (stream_tx, stream_rx) = mpsc::channel::<UnifiedStreamEvent>(CHANNEL_BUFFER_SIZE);
+    let (market_input_tx, market_input_rx) =
+        mpsc::channel::<UnifiedStreamEvent>(CHANNEL_BUFFER_SIZE);
+    let (market_tx, market_rx) = mpsc::channel::<MarketFeatureRecord>(CHANNEL_BUFFER_SIZE);
 
     tokio::fs::create_dir_all("output")
         .await
         .context("failed to create output directory")?;
 
-    let processor_task = tokio::spawn(run_processing_stage(ingestion_rx, processing_tx));
-    let storage_task = tokio::spawn(run_storage_stage(processing_rx, "output/aura_stream.pb"));
+    let processor_task = tokio::spawn(run_processing_stage(
+        ingestion_rx,
+        stream_tx,
+        market_input_tx,
+    ));
+    let stream_storage_task = tokio::spawn(run_storage_stage(stream_rx, "output/aura_stream.pb"));
+    let market_engine_task = tokio::spawn(run_market_engine_stage(market_input_rx, market_tx));
+    let market_storage_task = tokio::spawn(run_market_storage_stage(
+        market_rx,
+        "output/aura_market_features.pb",
+    ));
 
     let mut jobs = JoinSet::new();
     for source in sources {
@@ -220,27 +273,38 @@ async fn main() -> Result<()> {
     let processed = processor_task
         .await
         .context("processing stage task join error")??;
-    let stored = storage_task
+    let stream_stored = stream_storage_task
         .await
-        .context("storage stage task join error")??;
+        .context("stream storage stage task join error")??;
+    let feature_generated = market_engine_task
+        .await
+        .context("market engine stage task join error")??;
+    let feature_stored = market_storage_task
+        .await
+        .context("market storage stage task join error")??;
 
     info!(
-        "Phase 1+2 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stored={stored}"
+        "Phase 1+2+3 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}"
     );
     Ok(())
 }
 
 async fn run_processing_stage(
     mut ingestion_rx: mpsc::Receiver<IngestionEnvelope>,
-    processing_tx: mpsc::Sender<UnifiedStreamEvent>,
+    stream_tx: mpsc::Sender<UnifiedStreamEvent>,
+    market_tx: mpsc::Sender<UnifiedStreamEvent>,
 ) -> Result<usize> {
     let mut count = 0usize;
     while let Some(envelope) = ingestion_rx.recv().await {
         let event = normalize_event(envelope)?;
-        processing_tx
-            .send(event)
+        stream_tx
+            .send(event.clone())
             .await
             .map_err(|_| anyhow!("processing channel closed before send"))?;
+        market_tx
+            .send(event)
+            .await
+            .map_err(|_| anyhow!("market input channel closed before send"))?;
         count += 1;
     }
     info!("processing stage finished with {count} events");
@@ -277,6 +341,88 @@ async fn run_storage_stage(
     Ok(count)
 }
 
+async fn run_market_engine_stage(
+    mut market_input_rx: mpsc::Receiver<UnifiedStreamEvent>,
+    market_tx: mpsc::Sender<MarketFeatureRecord>,
+) -> Result<usize> {
+    let mut state_map: HashMap<String, MarketSeriesState> = HashMap::new();
+    let mut count = 0usize;
+
+    while let Some(event) = market_input_rx.recv().await {
+        let key = event.source.clone();
+        let (close, volume) = extract_price_volume(&event);
+        let series = state_map.entry(key).or_default();
+
+        let open = series.prev_close.unwrap_or(close);
+        let high = open.max(close);
+        let low = open.min(close);
+
+        let alpha_fast = 2.0 / (EMA_FAST_PERIOD + 1.0);
+        let alpha_slow = 2.0 / (EMA_SLOW_PERIOD + 1.0);
+        let ema_fast = update_ema(series.ema_fast, close, alpha_fast);
+        let ema_slow = update_ema(series.ema_slow, close, alpha_slow);
+
+        let (rsi14, momentum) = update_rsi_momentum(series, close);
+        series.prev_close = Some(close);
+        series.ema_fast = Some(ema_fast);
+        series.ema_slow = Some(ema_slow);
+
+        let feature = MarketFeatureRecord {
+            source: event.source,
+            category: event.category,
+            feature_ts_ms: now_millis()?,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            ema_fast,
+            ema_slow,
+            rsi14,
+            momentum,
+        };
+
+        market_tx
+            .send(feature)
+            .await
+            .map_err(|_| anyhow!("market feature channel closed before send"))?;
+        count += 1;
+    }
+
+    info!("market engine stage emitted {count} feature records");
+    Ok(count)
+}
+
+async fn run_market_storage_stage(
+    mut market_rx: mpsc::Receiver<MarketFeatureRecord>,
+    path: &str,
+) -> Result<usize> {
+    let file = File::create(path)
+        .await
+        .with_context(|| format!("failed to create market storage file {path}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut count = 0usize;
+
+    while let Some(feature) = market_rx.recv().await {
+        let mut bytes = Vec::with_capacity(feature.encoded_len() + 10);
+        feature
+            .encode_length_delimited(&mut bytes)
+            .context("failed to protobuf-encode market feature")?;
+        writer
+            .write_all(&bytes)
+            .await
+            .context("failed to write market feature protobuf bytes")?;
+        count += 1;
+    }
+
+    writer
+        .flush()
+        .await
+        .context("failed to flush market storage file")?;
+    info!("market storage stage wrote {count} protobuf feature rows to {path}");
+    Ok(count)
+}
+
 fn normalize_event(envelope: IngestionEnvelope) -> Result<UnifiedStreamEvent> {
     let normalized_type = envelope
         .payload
@@ -286,10 +432,7 @@ fn normalize_event(envelope: IngestionEnvelope) -> Result<UnifiedStreamEvent> {
         .to_string();
     let payload_json =
         serde_json::to_vec(&envelope.payload).context("json payload encode failed")?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time before unix epoch")?
-        .as_millis() as i64;
+    let ts = now_millis()?;
 
     Ok(UnifiedStreamEvent {
         source: envelope.source,
@@ -298,6 +441,130 @@ fn normalize_event(envelope: IngestionEnvelope) -> Result<UnifiedStreamEvent> {
         ingest_ts_ms: ts,
         payload_json,
     })
+}
+
+fn now_millis() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before unix epoch")?
+        .as_millis() as i64)
+}
+
+fn update_ema(current: Option<f64>, value: f64, alpha: f64) -> f64 {
+    match current {
+        Some(prev) => (alpha * value) + ((1.0 - alpha) * prev),
+        None => value,
+    }
+}
+
+fn update_rsi_momentum(series: &mut MarketSeriesState, close: f64) -> (f64, f64) {
+    if let Some(prev) = series.prev_close {
+        let delta = close - prev;
+        let gain = delta.max(0.0);
+        let loss = (-delta).max(0.0);
+
+        series.gains.push_back(gain);
+        series.losses.push_back(loss);
+        if series.gains.len() > RSI_PERIOD {
+            series.gains.pop_front();
+        }
+        if series.losses.len() > RSI_PERIOD {
+            series.losses.pop_front();
+        }
+    }
+
+    if series.gains.is_empty() {
+        return (50.0, 0.0);
+    }
+
+    let avg_gain = series.gains.iter().sum::<f64>() / series.gains.len() as f64;
+    let avg_loss = series.losses.iter().sum::<f64>() / series.losses.len() as f64;
+    let rs = if avg_loss <= f64::EPSILON {
+        100.0
+    } else {
+        avg_gain / avg_loss
+    };
+    let rsi = if avg_loss <= f64::EPSILON {
+        100.0
+    } else {
+        100.0 - (100.0 / (1.0 + rs))
+    };
+
+    let momentum = series.prev_close.map(|prev| close - prev).unwrap_or(0.0);
+    (rsi, momentum)
+}
+
+fn extract_price_volume(event: &UnifiedStreamEvent) -> (f64, f64) {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&event.payload_json).unwrap_or_else(|_| serde_json::json!({}));
+
+    if let Some(messages) = parsed.get("messages").and_then(|v| v.as_array()) {
+        let mut prices = Vec::new();
+        let mut volumes = Vec::new();
+        for msg in messages {
+            if let Some(raw) = msg.as_str()
+                && let Ok(obj) = serde_json::from_str::<serde_json::Value>(raw)
+            {
+                if let Some(price) = extract_numeric_field(&obj, &["p", "price"]) {
+                    prices.push(price);
+                }
+                if let Some(volume) = extract_numeric_field(&obj, &["q", "size", "volume"]) {
+                    volumes.push(volume.abs());
+                }
+            }
+        }
+
+        if !prices.is_empty() {
+            let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
+            let total_volume = volumes.iter().sum::<f64>().max(1.0);
+            return (avg_price, total_volume);
+        }
+    }
+
+    if let Some(sample) = parsed.get("sample").and_then(|v| v.as_str())
+        && let Some(number) = first_float_from_text(sample)
+    {
+        return (number.abs().max(1.0), 1.0);
+    }
+
+    (fallback_price(event), 1.0)
+}
+
+fn extract_numeric_field(value: &serde_json::Value, fields: &[&str]) -> Option<f64> {
+    for field in fields {
+        if let Some(v) = value.get(field) {
+            if let Some(n) = v.as_f64() {
+                return Some(n);
+            }
+            if let Some(s) = v.as_str()
+                && let Ok(parsed) = s.parse::<f64>()
+            {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
+fn first_float_from_text(text: &str) -> Option<f64> {
+    for token in text.split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')) {
+        if token.is_empty() || token == "-" || token == "." {
+            continue;
+        }
+        if let Ok(n) = token.parse::<f64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn fallback_price(event: &UnifiedStreamEvent) -> f64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    event.source.hash(&mut hasher);
+    event.normalized_type.hash(&mut hasher);
+    event.ingest_ts_ms.hash(&mut hasher);
+    let value = hasher.finish();
+    (value % 50_000) as f64 / 10.0 + 10.0
 }
 
 async fn ingest_source(source: DataSource, context: IngestionContext) -> Result<IngestionEnvelope> {
