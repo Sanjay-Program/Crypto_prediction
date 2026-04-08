@@ -342,8 +342,7 @@ async fn main() -> Result<()> {
 
     info!(
         "Phase 1+2+3+4 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}, signal_generated={signal_generated}, signal_stored={}, signal_sources={}",
-        signal_storage.total_signals,
-        signal_storage.source_count
+        signal_storage.total_signals, signal_storage.source_count
     );
     Ok(())
 }

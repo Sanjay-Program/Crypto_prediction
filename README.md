@@ -95,6 +95,8 @@ A signal engine now consumes market features and emits compact directional signa
 
 - Output file: `aura_x_prime_ingestion/output/aura_market_signals.pb`
 - Format: length-delimited Protobuf market signal stream
+- Summary file: `aura_x_prime_ingestion/output/aura_signal_summary.json`
+- Summary contains per-source bullish/bearish/neutral counts and average confidence
 
 ## Backend integration with Rust outputs
 
@@ -104,9 +106,18 @@ The Flask API can now include Rust-generated context in prediction responses.
   - Request fields:
     - `symbol` (optional, default `BTC-USD`)
     - `include_market_context` (optional, default `false`)
+    - `horizon_days` (optional, default `7`, max `60`)
+    - `lookback_days` (optional, default `365`, max `3650`)
+    - `sequence_length` (optional, default `60`)
+    - `epochs` (optional, default `10`)
+    - `batch_size` (optional, default `1`)
   - When enabled, response includes:
     - latest market features from `aura_market_features.pb`
     - latest market signals from `aura_market_signals.pb`
+    - filtered signal summary from `aura_signal_summary.json`
+  - Response now also includes:
+    - confidence bands for each forecast point
+    - model info (cache hit flag + test metrics such as RMSE and MAPE)
 
 - `POST /predict/crypto/market-context`
   - Returns only Rust-derived market context for a symbol.
@@ -114,7 +125,17 @@ The Flask API can now include Rust-generated context in prediction responses.
     - `symbol` (optional, default `BTC-USD`)
     - `limit` (optional, default `10`, max `100`)
 
+- `POST /predict/crypto/batch`
+  - Run prediction for multiple symbols in one request.
+  - Request fields:
+    - `symbols` (required, non-empty array, up to 10 entries)
+    - Supports same optional controls as `/predict/crypto`
+
+- `GET /health`
+  - Returns backend health and cache/path info.
+
 ### Optional backend environment variables
 
 - `AURA_MARKET_FEATURES_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_features.pb`)
 - `AURA_MARKET_SIGNALS_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_signals.pb`)
+- `AURA_SIGNAL_SUMMARY_PATH` (defaults to `aura_x_prime_ingestion/output/aura_signal_summary.json`)
