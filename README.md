@@ -80,3 +80,41 @@ A market feature engine now runs after normalization to generate compact candle/
 
 - Output file: `aura_x_prime_ingestion/output/aura_market_features.pb`
 - Format: length-delimited Protobuf market feature stream
+
+## AURA-X PRIME (Phase 4 Implemented)
+
+A signal engine now consumes market features and emits compact directional signal records.
+
+### Phase 4 pipeline
+
+- `ingestion -> processing -> stream storage`
+- `processing -> market engine -> market feature storage`
+- `market engine -> signal engine -> signal storage`
+
+### Phase 4 output
+
+- Output file: `aura_x_prime_ingestion/output/aura_market_signals.pb`
+- Format: length-delimited Protobuf market signal stream
+
+## Backend integration with Rust outputs
+
+The Flask API can now include Rust-generated context in prediction responses.
+
+- `POST /predict/crypto`
+  - Request fields:
+    - `symbol` (optional, default `BTC-USD`)
+    - `include_market_context` (optional, default `false`)
+  - When enabled, response includes:
+    - latest market features from `aura_market_features.pb`
+    - latest market signals from `aura_market_signals.pb`
+
+- `POST /predict/crypto/market-context`
+  - Returns only Rust-derived market context for a symbol.
+  - Request fields:
+    - `symbol` (optional, default `BTC-USD`)
+    - `limit` (optional, default `10`, max `100`)
+
+### Optional backend environment variables
+
+- `AURA_MARKET_FEATURES_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_features.pb`)
+- `AURA_MARKET_SIGNALS_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_signals.pb`)

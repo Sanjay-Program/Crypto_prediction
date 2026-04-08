@@ -113,6 +113,26 @@ struct MarketFeatureRecord {
     momentum: f64,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct MarketSignalRecord {
+    #[prost(string, tag = "1")]
+    source: String,
+    #[prost(string, tag = "2")]
+    category: String,
+    #[prost(int64, tag = "3")]
+    signal_ts_ms: i64,
+    #[prost(double, tag = "4")]
+    trend_score: f64,
+    #[prost(double, tag = "5")]
+    volatility_score: f64,
+    #[prost(double, tag = "6")]
+    momentum_score: f64,
+    #[prost(double, tag = "7")]
+    confidence: f64,
+    #[prost(string, tag = "8")]
+    recommendation: String,
+}
+
 #[derive(Debug, Default)]
 struct MarketSeriesState {
     prev_close: Option<f64>,
@@ -223,6 +243,9 @@ async fn main() -> Result<()> {
     let (market_input_tx, market_input_rx) =
         mpsc::channel::<UnifiedStreamEvent>(CHANNEL_BUFFER_SIZE);
     let (market_tx, market_rx) = mpsc::channel::<MarketFeatureRecord>(CHANNEL_BUFFER_SIZE);
+    let (market_signal_input_tx, market_signal_input_rx) =
+        mpsc::channel::<MarketFeatureRecord>(CHANNEL_BUFFER_SIZE);
+    let (signal_tx, signal_rx) = mpsc::channel::<MarketSignalRecord>(CHANNEL_BUFFER_SIZE);
 
     tokio::fs::create_dir_all("output")
         .await
@@ -234,11 +257,18 @@ async fn main() -> Result<()> {
         market_input_tx,
     ));
     let stream_storage_task = tokio::spawn(run_storage_stage(stream_rx, "output/aura_stream.pb"));
-    let market_engine_task = tokio::spawn(run_market_engine_stage(market_input_rx, market_tx));
+    let market_engine_task = tokio::spawn(run_market_engine_stage(
+        market_input_rx,
+        market_tx,
+        market_signal_input_tx,
+    ));
     let market_storage_task = tokio::spawn(run_market_storage_stage(
         market_rx,
         "output/aura_market_features.pb",
     ));
+    let signal_engine_task = tokio::spawn(run_signal_engine_stage(market_signal_input_rx, signal_tx));
+    let signal_storage_task =
+        tokio::spawn(run_signal_storage_stage(signal_rx, "output/aura_market_signals.pb"));
 
     let mut jobs = JoinSet::new();
     for source in sources {
@@ -282,9 +312,15 @@ async fn main() -> Result<()> {
     let feature_stored = market_storage_task
         .await
         .context("market storage stage task join error")??;
+    let signal_generated = signal_engine_task
+        .await
+        .context("signal engine stage task join error")??;
+    let signal_stored = signal_storage_task
+        .await
+        .context("signal storage stage task join error")??;
 
     info!(
-        "Phase 1+2+3 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}"
+        "Phase 1+2+3+4 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}, signal_generated={signal_generated}, signal_stored={signal_stored}"
     );
     Ok(())
 }
@@ -344,6 +380,7 @@ async fn run_storage_stage(
 async fn run_market_engine_stage(
     mut market_input_rx: mpsc::Receiver<UnifiedStreamEvent>,
     market_tx: mpsc::Sender<MarketFeatureRecord>,
+    market_signal_input_tx: mpsc::Sender<MarketFeatureRecord>,
 ) -> Result<usize> {
     let mut state_map: HashMap<String, MarketSeriesState> = HashMap::new();
     let mut count = 0usize;
@@ -383,13 +420,64 @@ async fn run_market_engine_stage(
         };
 
         market_tx
-            .send(feature)
+            .send(feature.clone())
             .await
             .map_err(|_| anyhow!("market feature channel closed before send"))?;
+        market_signal_input_tx
+            .send(feature)
+            .await
+            .map_err(|_| anyhow!("market signal input channel closed before send"))?;
         count += 1;
     }
 
     info!("market engine stage emitted {count} feature records");
+    Ok(count)
+}
+
+async fn run_signal_engine_stage(
+    mut market_signal_input_rx: mpsc::Receiver<MarketFeatureRecord>,
+    signal_tx: mpsc::Sender<MarketSignalRecord>,
+) -> Result<usize> {
+    let mut count = 0usize;
+
+    while let Some(feature) = market_signal_input_rx.recv().await {
+        let close_abs = feature.close.abs().max(1.0);
+        let trend_score = (feature.ema_fast - feature.ema_slow) / close_abs;
+        let volatility_score = (feature.high - feature.low).abs() / close_abs;
+        let momentum_score = feature.momentum / close_abs;
+
+        let confidence_raw = (trend_score.abs() * 4.0)
+            + (momentum_score.abs() * 3.0)
+            + ((1.0 - volatility_score).max(0.0) * 2.0);
+        let confidence = (confidence_raw / 9.0).clamp(0.0, 1.0);
+
+        let recommendation = if trend_score > 0.001 && momentum_score > 0.0 {
+            "bullish"
+        } else if trend_score < -0.001 && momentum_score < 0.0 {
+            "bearish"
+        } else {
+            "neutral"
+        };
+
+        let signal = MarketSignalRecord {
+            source: feature.source,
+            category: feature.category,
+            signal_ts_ms: now_millis()?,
+            trend_score,
+            volatility_score,
+            momentum_score,
+            confidence,
+            recommendation: recommendation.to_string(),
+        };
+
+        signal_tx
+            .send(signal)
+            .await
+            .map_err(|_| anyhow!("market signal channel closed before send"))?;
+        count += 1;
+    }
+
+    info!("signal engine stage emitted {count} signal records");
     Ok(count)
 }
 
@@ -420,6 +508,36 @@ async fn run_market_storage_stage(
         .await
         .context("failed to flush market storage file")?;
     info!("market storage stage wrote {count} protobuf feature rows to {path}");
+    Ok(count)
+}
+
+async fn run_signal_storage_stage(
+    mut signal_rx: mpsc::Receiver<MarketSignalRecord>,
+    path: &str,
+) -> Result<usize> {
+    let file = File::create(path)
+        .await
+        .with_context(|| format!("failed to create signal storage file {path}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut count = 0usize;
+
+    while let Some(signal) = signal_rx.recv().await {
+        let mut bytes = Vec::with_capacity(signal.encoded_len() + 10);
+        signal
+            .encode_length_delimited(&mut bytes)
+            .context("failed to protobuf-encode market signal")?;
+        writer
+            .write_all(&bytes)
+            .await
+            .context("failed to write market signal protobuf bytes")?;
+        count += 1;
+    }
+
+    writer
+        .flush()
+        .await
+        .context("failed to flush signal storage file")?;
+    info!("signal storage stage wrote {count} protobuf signal rows to {path}");
     Ok(count)
 }
 
@@ -985,5 +1103,61 @@ fn source_websocket(
             max_messages,
         },
         rate_limit_per_second,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_event(payload: serde_json::Value) -> UnifiedStreamEvent {
+        UnifiedStreamEvent {
+            source: "binance_btcusdt_trade".to_string(),
+            category: "crypto".to_string(),
+            normalized_type: "websocket".to_string(),
+            ingest_ts_ms: 1_700_000_000_000,
+            payload_json: serde_json::to_vec(&payload).expect("json payload encoding should work"),
+        }
+    }
+
+    #[test]
+    fn ema_initializes_with_first_value() {
+        let seeded = update_ema(None, 100.0, 0.2);
+        let updated = update_ema(Some(seeded), 120.0, 0.2);
+        assert_eq!(seeded, 100.0);
+        assert!(updated > 100.0);
+        assert!(updated < 120.0);
+    }
+
+    #[test]
+    fn rsi_and_momentum_progress_with_uptrend() {
+        let mut state = MarketSeriesState::default();
+        state.prev_close = Some(100.0);
+        for price in [101.0, 103.0, 104.0, 105.0] {
+            let _ = update_rsi_momentum(&mut state, price);
+            state.prev_close = Some(price);
+        }
+        let (rsi, momentum) = update_rsi_momentum(&mut state, 106.0);
+        assert!(rsi >= 50.0);
+        assert!(momentum > 0.0);
+    }
+
+    #[test]
+    fn extract_price_volume_from_ws_messages() {
+        let event = test_event(serde_json::json!({
+            "messages": [
+                "{\"p\":\"101.5\",\"q\":\"0.25\"}",
+                "{\"p\":\"102.5\",\"q\":\"0.75\"}"
+            ]
+        }));
+        let (price, volume) = extract_price_volume(&event);
+        assert!((price - 102.0).abs() < 1e-9);
+        assert!((volume - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn float_extraction_works_for_sample_text() {
+        let value = first_float_from_text("BTC printed near 69420.55 in latest update");
+        assert_eq!(value, Some(69420.55));
     }
 }
