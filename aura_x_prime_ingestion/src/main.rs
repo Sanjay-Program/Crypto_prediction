@@ -302,7 +302,9 @@ async fn fetch_websocket_messages(url: &str, max_messages: usize) -> Result<serd
             .with_context(|| format!("websocket timeout: {url}"))?;
         match next_msg {
             Some(Ok(msg)) => {
-                messages.push(msg.to_text().unwrap_or("").to_string());
+                if let Some(text) = msg.to_text().ok() {
+                    messages.push(text.to_string());
+                }
             }
             Some(Err(err)) => return Err(anyhow!("websocket read error {url}: {err}")),
             None => break,

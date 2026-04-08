@@ -25,7 +25,7 @@ Technologies Used
 
 This repository now includes a Phase 1 Rust ingestion core at:
 
-- `/home/runner/work/Crypto_prediction/Crypto_prediction/aura_x_prime_ingestion`
+- `./aura_x_prime_ingestion`
 
 ### What it includes
 
@@ -41,7 +41,7 @@ This repository now includes a Phase 1 Rust ingestion core at:
 ### Run
 
 ```bash
-cd /home/runner/work/Crypto_prediction/Crypto_prediction/aura_x_prime_ingestion
+cd aura_x_prime_ingestion
 cargo run
 ```
 
