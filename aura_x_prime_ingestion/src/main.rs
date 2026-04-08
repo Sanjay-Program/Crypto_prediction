@@ -142,6 +142,24 @@ struct MarketSeriesState {
     losses: VecDeque<f64>,
 }
 
+#[derive(Debug, Serialize)]
+struct SignalSourceSummary {
+    source: String,
+    category: String,
+    bullish: usize,
+    bearish: usize,
+    neutral: usize,
+    avg_confidence: f64,
+    last_recommendation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SignalStorageSummary {
+    total_signals: usize,
+    source_count: usize,
+    sources: Vec<SignalSourceSummary>,
+}
+
 #[derive(Debug)]
 struct HeaderRotator {
     index: AtomicUsize,
@@ -318,12 +336,14 @@ async fn main() -> Result<()> {
     let signal_generated = signal_engine_task
         .await
         .context("signal engine stage task join error")??;
-    let signal_stored = signal_storage_task
+    let signal_storage = signal_storage_task
         .await
         .context("signal storage stage task join error")??;
 
     info!(
-        "Phase 1+2+3+4 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}, signal_generated={signal_generated}, signal_stored={signal_stored}"
+        "Phase 1+2+3+4 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stream_stored={stream_stored}, feature_generated={feature_generated}, feature_stored={feature_stored}, signal_generated={signal_generated}, signal_stored={}, signal_sources={}",
+        signal_storage.total_signals,
+        signal_storage.source_count
     );
     Ok(())
 }
@@ -517,14 +537,40 @@ async fn run_market_storage_stage(
 async fn run_signal_storage_stage(
     mut signal_rx: mpsc::Receiver<MarketSignalRecord>,
     path: &str,
-) -> Result<usize> {
+) -> Result<SignalStorageSummary> {
     let file = File::create(path)
         .await
         .with_context(|| format!("failed to create signal storage file {path}"))?;
     let mut writer = BufWriter::new(file);
     let mut count = 0usize;
+    let mut source_stats: HashMap<String, SignalSourceSummary> = HashMap::new();
 
     while let Some(signal) = signal_rx.recv().await {
+        let key = signal.source.clone();
+        let entry = source_stats
+            .entry(key.clone())
+            .or_insert_with(|| SignalSourceSummary {
+                source: key,
+                category: signal.category.clone(),
+                bullish: 0,
+                bearish: 0,
+                neutral: 0,
+                avg_confidence: 0.0,
+                last_recommendation: "neutral".to_string(),
+            });
+        match signal.recommendation.as_str() {
+            "bullish" => entry.bullish += 1,
+            "bearish" => entry.bearish += 1,
+            _ => entry.neutral += 1,
+        }
+        entry.last_recommendation = signal.recommendation.clone();
+        let prior = entry.bullish + entry.bearish + entry.neutral - 1;
+        entry.avg_confidence = if prior == 0 {
+            signal.confidence
+        } else {
+            ((entry.avg_confidence * prior as f64) + signal.confidence) / (prior as f64 + 1.0)
+        };
+
         let mut bytes = Vec::with_capacity(signal.encoded_len() + 10);
         signal
             .encode_length_delimited(&mut bytes)
@@ -540,8 +586,23 @@ async fn run_signal_storage_stage(
         .flush()
         .await
         .context("failed to flush signal storage file")?;
+
+    let mut sources = source_stats.into_values().collect::<Vec<_>>();
+    sources.sort_by(|a, b| b.avg_confidence.total_cmp(&a.avg_confidence));
+    let summary = SignalStorageSummary {
+        total_signals: count,
+        source_count: sources.len(),
+        sources,
+    };
+    let summary_path = "output/aura_signal_summary.json";
+    let summary_json =
+        serde_json::to_vec_pretty(&summary).context("failed to encode signal summary json")?;
+    tokio::fs::write(summary_path, summary_json)
+        .await
+        .with_context(|| format!("failed to write signal summary file {summary_path}"))?;
+
     info!("signal storage stage wrote {count} protobuf signal rows to {path}");
-    Ok(count)
+    Ok(summary)
 }
 
 fn normalize_event(envelope: IngestionEnvelope) -> Result<UnifiedStreamEvent> {
