@@ -46,3 +46,16 @@ cargo run
 ```
 
 > Note: some external endpoints can rate-limit or require API keys; failures are logged per source and do not crash the full ingestion batch.
+
+## AURA-X PRIME (Phase 2 Implemented)
+
+The Rust module now includes a lightweight stream-processing pipeline using Tokio channels:
+
+- `ingestion -> processing -> storage`
+- Processing stage normalizes records into a unified schema
+- Storage stage serializes normalized events with Protobuf binary encoding
+
+### Phase 2 output
+
+- Output file: `aura_x_prime_ingestion/output/aura_stream.pb`
+- Format: length-delimited Protobuf event stream

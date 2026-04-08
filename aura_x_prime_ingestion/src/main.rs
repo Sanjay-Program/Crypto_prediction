@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
+use prost::Message;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use scraper::{Html, Selector};
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::connect_async;
@@ -52,6 +56,20 @@ struct IngestionEnvelope {
     source: String,
     category: String,
     payload: serde_json::Value,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct UnifiedStreamEvent {
+    #[prost(string, tag = "1")]
+    source: String,
+    #[prost(string, tag = "2")]
+    category: String,
+    #[prost(string, tag = "3")]
+    normalized_type: String,
+    #[prost(int64, tag = "4")]
+    ingest_ts_ms: i64,
+    #[prost(bytes = "vec", tag = "5")]
+    payload_json: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -125,7 +143,7 @@ async fn main() -> Result<()> {
 
     let sources = build_source_catalog();
     info!(
-        "AURA-X PRIME Phase 1 ingest engine booting with {} configured sources",
+        "AURA-X PRIME booting with {} configured sources",
         sources.len()
     );
 
@@ -150,11 +168,29 @@ async fn main() -> Result<()> {
         limiters: Arc::new(limiters),
     };
 
+    let (ingestion_tx, ingestion_rx) = mpsc::channel::<IngestionEnvelope>(4096);
+    let (processing_tx, processing_rx) = mpsc::channel::<UnifiedStreamEvent>(4096);
+
+    tokio::fs::create_dir_all("output")
+        .await
+        .context("failed to create output directory")?;
+
+    let processor_task = tokio::spawn(run_processing_stage(ingestion_rx, processing_tx));
+    let storage_task = tokio::spawn(run_storage_stage(processing_rx, "output/aura_stream.pb"));
+
     let mut jobs = JoinSet::new();
     for source in sources {
         let ctx = context.clone();
-        jobs.spawn(async move { ingest_source(source, ctx).await });
+        let tx = ingestion_tx.clone();
+        jobs.spawn(async move {
+            let envelope = ingest_source(source, ctx).await?;
+            tx.send(envelope)
+                .await
+                .map_err(|_| anyhow!("ingestion channel closed before send"))?;
+            Ok::<(), anyhow::Error>(())
+        });
     }
+    drop(ingestion_tx);
 
     let mut success = 0usize;
     let mut failed = 0usize;
@@ -172,8 +208,87 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("Phase 1 ingestion completed. success={success}, failed={failed}");
+    let processed = processor_task
+        .await
+        .context("processing stage task join error")??;
+    let stored = storage_task
+        .await
+        .context("storage stage task join error")??;
+
+    info!(
+        "Phase 1+2 completed. ingest_success={success}, ingest_failed={failed}, processed={processed}, stored={stored}"
+    );
     Ok(())
+}
+
+async fn run_processing_stage(
+    mut ingestion_rx: mpsc::Receiver<IngestionEnvelope>,
+    processing_tx: mpsc::Sender<UnifiedStreamEvent>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    while let Some(envelope) = ingestion_rx.recv().await {
+        let event = normalize_event(envelope)?;
+        processing_tx
+            .send(event)
+            .await
+            .map_err(|_| anyhow!("processing channel closed before send"))?;
+        count += 1;
+    }
+    info!("processing stage finished with {count} events");
+    Ok(count)
+}
+
+async fn run_storage_stage(
+    mut processing_rx: mpsc::Receiver<UnifiedStreamEvent>,
+    path: &str,
+) -> Result<usize> {
+    let file = File::create(path)
+        .await
+        .with_context(|| format!("failed to create storage file {path}"))?;
+    let mut writer = BufWriter::new(file);
+    let mut count = 0usize;
+
+    while let Some(event) = processing_rx.recv().await {
+        let mut bytes = Vec::with_capacity(event.encoded_len() + 10);
+        event
+            .encode_length_delimited(&mut bytes)
+            .context("failed to protobuf-encode event")?;
+        writer
+            .write_all(&bytes)
+            .await
+            .context("failed to write protobuf bytes")?;
+        count += 1;
+    }
+
+    writer
+        .flush()
+        .await
+        .context("failed to flush storage file")?;
+    info!("storage stage wrote {count} protobuf events to {path}");
+    Ok(count)
+}
+
+fn normalize_event(envelope: IngestionEnvelope) -> Result<UnifiedStreamEvent> {
+    let normalized_type = envelope
+        .payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let payload_json =
+        serde_json::to_vec(&envelope.payload).context("json payload encode failed")?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time before unix epoch")?
+        .as_millis() as i64;
+
+    Ok(UnifiedStreamEvent {
+        source: envelope.source,
+        category: envelope.category,
+        normalized_type,
+        ingest_ts_ms: ts,
+        payload_json,
+    })
 }
 
 async fn ingest_source(source: DataSource, context: IngestionContext) -> Result<IngestionEnvelope> {
