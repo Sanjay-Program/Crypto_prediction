@@ -59,3 +59,7 @@ The Rust module now includes a lightweight stream-processing pipeline using Toki
 
 - Output file: `aura_x_prime_ingestion/output/aura_stream.pb`
 - Format: length-delimited Protobuf event stream
+
+### Optional environment variables
+
+- `FRED_API_KEY` (optional): used for FRED macro API requests when provided

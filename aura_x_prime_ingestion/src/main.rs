@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -26,6 +27,14 @@ const USER_AGENTS: [&str; 6] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
 ];
+
+const CHANNEL_BUFFER_SIZE: usize = 4096;
+const HTTP_RETRY_ATTEMPTS: usize = 4;
+const HTTP_INITIAL_BACKOFF_MS: u64 = 400;
+const HTML_RETRY_ATTEMPTS: usize = 4;
+const HTML_INITIAL_BACKOFF_MS: u64 = 500;
+const WS_RETRY_ATTEMPTS: usize = 3;
+const WS_INITIAL_BACKOFF_MS: u64 = 600;
 
 #[derive(Clone, Debug)]
 enum SourceKind {
@@ -168,8 +177,8 @@ async fn main() -> Result<()> {
         limiters: Arc::new(limiters),
     };
 
-    let (ingestion_tx, ingestion_rx) = mpsc::channel::<IngestionEnvelope>(4096);
-    let (processing_tx, processing_rx) = mpsc::channel::<UnifiedStreamEvent>(4096);
+    let (ingestion_tx, ingestion_rx) = mpsc::channel::<IngestionEnvelope>(CHANNEL_BUFFER_SIZE);
+    let (processing_tx, processing_rx) = mpsc::channel::<UnifiedStreamEvent>(CHANNEL_BUFFER_SIZE);
 
     tokio::fs::create_dir_all("output")
         .await
@@ -302,9 +311,11 @@ async fn ingest_source(source: DataSource, context: IngestionContext) -> Result<
 
     let payload = match source.kind.clone() {
         SourceKind::HttpJson { url } => {
-            with_retry(4, Duration::from_millis(400), || async {
-                fetch_http_json(&context.client, &context.rotator, &url).await
-            })
+            with_retry(
+                HTTP_RETRY_ATTEMPTS,
+                Duration::from_millis(HTTP_INITIAL_BACKOFF_MS),
+                || async { fetch_http_json(&context.client, &context.rotator, &url).await },
+            )
             .await?
         }
         SourceKind::HtmlScrape {
@@ -312,22 +323,28 @@ async fn ingest_source(source: DataSource, context: IngestionContext) -> Result<
             css_selector,
             max_items,
         } => {
-            with_retry(4, Duration::from_millis(500), || async {
-                fetch_html_snippets(
-                    &context.client,
-                    &context.rotator,
-                    &url,
-                    &css_selector,
-                    max_items,
-                )
-                .await
-            })
+            with_retry(
+                HTML_RETRY_ATTEMPTS,
+                Duration::from_millis(HTML_INITIAL_BACKOFF_MS),
+                || async {
+                    fetch_html_snippets(
+                        &context.client,
+                        &context.rotator,
+                        &url,
+                        &css_selector,
+                        max_items,
+                    )
+                    .await
+                },
+            )
             .await?
         }
         SourceKind::WebSocket { url, max_messages } => {
-            with_retry(3, Duration::from_millis(600), || async {
-                fetch_websocket_messages(&url, max_messages).await
-            })
+            with_retry(
+                WS_RETRY_ATTEMPTS,
+                Duration::from_millis(WS_INITIAL_BACKOFF_MS),
+                || async { fetch_websocket_messages(&url, max_messages).await },
+            )
             .await?
         }
     };
@@ -487,12 +504,7 @@ fn build_source_catalog() -> Vec<DataSource> {
             15,
             0.5,
         ),
-        source_http_json(
-            "fred_series_gdp",
-            "macro",
-            "https://api.stlouisfed.org/fred/series?series_id=GDP&api_key=abcdefghijklmnopqrstuvwxyz123456&file_type=json",
-            0.3,
-        ),
+        source_http_json("fred_series_gdp", "macro", &fred_series_url("GDP"), 0.3),
         source_http_json(
             "world_bank_gdp_india",
             "macro",
@@ -604,7 +616,7 @@ fn build_source_catalog() -> Vec<DataSource> {
         sources.push(source_http_json(
             &format!("fred_{series}"),
             "macro",
-            &format!("https://api.stlouisfed.org/fred/series?series_id={series}&file_type=json"),
+            &fred_series_url(series),
             0.3,
         ));
     }
@@ -658,6 +670,17 @@ fn source_http_json(
         },
         rate_limit_per_second,
     }
+}
+
+fn fred_series_url(series: &str) -> String {
+    if let Ok(api_key) = env::var("FRED_API_KEY") {
+        if !api_key.trim().is_empty() {
+            return format!(
+                "https://api.stlouisfed.org/fred/series?series_id={series}&api_key={api_key}&file_type=json"
+            );
+        }
+    }
+    format!("https://api.stlouisfed.org/fred/series?series_id={series}&file_type=json")
 }
 
 fn source_html(
