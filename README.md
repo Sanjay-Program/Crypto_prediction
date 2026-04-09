@@ -134,6 +134,33 @@ The Flask API can now include Rust-generated context in prediction responses.
 - `GET /health`
   - Returns backend health and cache/path info.
 
+## Auto-trading APIs
+
+- `POST /trade/auto/decision`
+  - Generates a risk-aware trade action (`buy` / `sell` / `hold`) from:
+    - model forecast + uncertainty bands
+    - latest Rust market signals/features
+  - Request fields:
+    - `symbol` (optional, default `BTC-USD`)
+    - optional prediction controls: `lookback_days`, `sequence_length`, `epochs`, `batch_size`, `horizon_days`
+    - optional risk controls: `max_position_pct`, `stop_loss_pct`, `take_profit_pct`, `fee_bps`
+    - `context_limit` (optional, default `20`)
+  - Response includes:
+    - `decision` (score, confidence, suggested position, stop/take-profit prices)
+    - `prediction`
+    - `market_context`
+
+- `POST /trade/auto/backtest`
+  - Runs a built-in paper-trading simulation on historical closes using EMA/RSI driven entries/exits and risk controls.
+  - Request fields:
+    - `symbol` (optional, default `BTC-USD`)
+    - `lookback_days` (optional)
+    - `backtest_days` (optional, default `120`)
+    - `starting_cash` (optional, default `10000`)
+    - `max_position_pct`, `stop_loss_pct`, `take_profit_pct`, `fee_bps` (optional)
+  - Response includes:
+    - `ending_equity`, `total_return_pct`, `max_drawdown_pct`, `win_rate_pct`, and recent `trades`
+
 ### Optional backend environment variables
 
 - `AURA_MARKET_FEATURES_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_features.pb`)

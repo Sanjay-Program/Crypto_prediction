@@ -502,6 +502,7 @@ def run_single_prediction(symbol, include_market_context=False, lookback_days=36
         "confidence_bands": bands,
         "model_info": {
             "from_cache": from_cache,
+            "last_close": artifact["last_close"],
             "history_points": artifact["history_points"],
             "lookback_days": artifact["lookback_days"],
             "sequence_length": artifact["sequence_length"],
@@ -534,6 +535,241 @@ def _parse_int(payload, key, default_value, min_value, max_value):
     except (TypeError, ValueError):
         value = default_value
     return max(min_value, min(max_value, value))
+
+
+def _parse_float(payload, key, default_value, min_value, max_value):
+    raw = payload.get(key, default_value)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default_value
+    return max(min_value, min(max_value, value))
+
+
+def _latest_signal_hint(market_context):
+    latest_signals = market_context.get("latest_signals", []) if market_context else []
+    if not latest_signals:
+        return {"recommendation": "neutral", "confidence": 0.0}
+    signal = latest_signals[-1]
+    return {
+        "recommendation": str(signal.get("recommendation", "neutral")).lower(),
+        "confidence": float(signal.get("confidence", 0.0)),
+    }
+
+
+def _latest_feature_hint(market_context):
+    latest_features = market_context.get("latest_features", []) if market_context else []
+    if not latest_features:
+        return {"momentum": 0.0, "rsi14": 50.0}
+    feature = latest_features[-1]
+    return {
+        "momentum": float(feature.get("momentum", 0.0)),
+        "rsi14": float(feature.get("rsi14", 50.0)),
+    }
+
+
+def generate_auto_trade_decision(
+    symbol,
+    prediction_payload,
+    market_context,
+    max_position_pct=0.25,
+    stop_loss_pct=0.03,
+    take_profit_pct=0.06,
+    fee_bps=10.0,
+):
+    predictions = prediction_payload.get("predictions", [])
+    bands = prediction_payload.get("confidence_bands", [])
+    model_info = prediction_payload.get("model_info", {})
+
+    if not predictions:
+        return {"symbol": symbol, "action": "hold", "reason": "No predictions available"}
+
+    current_price = float(model_info.get("last_close", predictions[0]))
+    target_price = float(predictions[-1])
+    expected_return_pct = ((target_price - current_price) / max(current_price, EPSILON)) * 100.0
+
+    avg_band_width_pct = 0.0
+    if bands:
+        widths = []
+        for band, pred in zip(bands, predictions):
+            low = float(band.get("low", pred))
+            high = float(band.get("high", pred))
+            widths.append(((high - low) / max(pred, EPSILON)) * 100.0)
+        if widths:
+            avg_band_width_pct = float(np.mean(widths))
+
+    signal_hint = _latest_signal_hint(market_context)
+    feature_hint = _latest_feature_hint(market_context)
+
+    signal_bonus = 0.0
+    if signal_hint["recommendation"] == "bullish":
+        signal_bonus = 0.5 * signal_hint["confidence"]
+    elif signal_hint["recommendation"] == "bearish":
+        signal_bonus = -0.5 * signal_hint["confidence"]
+
+    momentum_bonus = 0.1 if feature_hint["momentum"] > 0 else -0.1 if feature_hint["momentum"] < 0 else 0.0
+    rsi_penalty = 0.15 if feature_hint["rsi14"] > 72 else -0.05 if feature_hint["rsi14"] < 35 else 0.0
+    fee_pct = fee_bps / 100.0
+    uncertainty_penalty = min(1.5, avg_band_width_pct * 0.2)
+
+    score = expected_return_pct - fee_pct - uncertainty_penalty + signal_bonus + momentum_bonus - rsi_penalty
+
+    action = "hold"
+    if score >= 1.0:
+        action = "buy"
+    elif score <= -1.0:
+        action = "sell"
+
+    confidence = max(0.0, min(1.0, 0.5 + (score / 10.0)))
+    suggested_position_pct = max(0.0, min(max_position_pct, max_position_pct * confidence))
+
+    stop_loss_price = float(max(0.0, current_price * (1.0 - stop_loss_pct)))
+    take_profit_price = float(current_price * (1.0 + take_profit_pct))
+
+    return {
+        "symbol": symbol,
+        "action": action,
+        "score": float(score),
+        "confidence": float(confidence),
+        "expected_return_pct": float(expected_return_pct),
+        "avg_band_width_pct": float(avg_band_width_pct),
+        "risk": {
+            "max_position_pct": float(max_position_pct),
+            "suggested_position_pct": float(suggested_position_pct),
+            "stop_loss_pct": float(stop_loss_pct),
+            "take_profit_pct": float(take_profit_pct),
+            "fee_bps": float(fee_bps),
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+        },
+        "signals": {
+            "recommendation": signal_hint["recommendation"],
+            "signal_confidence": signal_hint["confidence"],
+            "momentum": feature_hint["momentum"],
+            "rsi14": feature_hint["rsi14"],
+        },
+    }
+
+
+def run_paper_backtest(
+    symbol,
+    lookback_days=365,
+    backtest_days=120,
+    starting_cash=10000.0,
+    max_position_pct=0.25,
+    stop_loss_pct=0.03,
+    take_profit_pct=0.06,
+    fee_bps=10.0,
+):
+    close_series = fetch_historical_crypto_data(symbol, lookback_days=lookback_days)
+    if close_series is None or len(close_series) < 60:
+        return None, "Not enough historical data for backtest"
+
+    prices = close_series.astype(float).tail(max(60, backtest_days + 30)).reset_index(drop=True)
+    df = pd.DataFrame({"close": prices})
+    df["ema_fast"] = df["close"].ewm(span=5, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=14, adjust=False).mean()
+    delta = df["close"].diff().fillna(0.0)
+    gains = delta.clip(lower=0.0).rolling(14).mean()
+    losses = (-delta.clip(upper=0.0)).rolling(14).mean().replace(0.0, EPSILON)
+    rs = gains / losses
+    df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+    df["rsi"] = df["rsi"].fillna(50.0)
+
+    fee_rate = fee_bps / 10000.0
+    cash = float(starting_cash)
+    units = 0.0
+    entry_price = None
+    trades = []
+    equity_curve = []
+    wins = 0
+    sell_count = 0
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        price = float(row["close"])
+        equity = cash + units * price
+        equity_curve.append(equity)
+
+        if units > 0.0 and entry_price is not None:
+            if price <= entry_price * (1.0 - stop_loss_pct):
+                proceeds = units * price * (1.0 - fee_rate)
+                pnl = proceeds - (units * entry_price)
+                cash += proceeds
+                trades.append({"side": "sell", "price": price, "reason": "stop_loss", "pnl": float(pnl)})
+                wins += 1 if pnl > 0 else 0
+                sell_count += 1
+                units = 0.0
+                entry_price = None
+                continue
+            if price >= entry_price * (1.0 + take_profit_pct):
+                proceeds = units * price * (1.0 - fee_rate)
+                pnl = proceeds - (units * entry_price)
+                cash += proceeds
+                trades.append({"side": "sell", "price": price, "reason": "take_profit", "pnl": float(pnl)})
+                wins += 1 if pnl > 0 else 0
+                sell_count += 1
+                units = 0.0
+                entry_price = None
+                continue
+
+        bullish = float(row["ema_fast"]) > float(row["ema_slow"]) and float(row["rsi"]) < 70.0
+        bearish = float(row["ema_fast"]) < float(row["ema_slow"]) or float(row["rsi"]) > 75.0
+
+        if units <= 0.0 and bullish:
+            equity = cash
+            budget = equity * max_position_pct
+            if budget > 0.0:
+                buy_units = (budget * (1.0 - fee_rate)) / max(price, EPSILON)
+                cost = buy_units * price
+                cash -= cost
+                units += buy_units
+                entry_price = price
+                trades.append({"side": "buy", "price": price, "reason": "bullish_cross", "units": float(buy_units)})
+        elif units > 0.0 and bearish:
+            proceeds = units * price * (1.0 - fee_rate)
+            pnl = proceeds - (units * (entry_price if entry_price is not None else price))
+            cash += proceeds
+            trades.append({"side": "sell", "price": price, "reason": "bearish_cross", "pnl": float(pnl)})
+            wins += 1 if pnl > 0 else 0
+            sell_count += 1
+            units = 0.0
+            entry_price = None
+
+    final_price = float(df.iloc[-1]["close"])
+    final_equity = cash + units * final_price
+    start_equity = float(starting_cash)
+    total_return_pct = ((final_equity - start_equity) / max(start_equity, EPSILON)) * 100.0
+
+    max_drawdown_pct = 0.0
+    if equity_curve:
+        peak = equity_curve[0]
+        max_dd = 0.0
+        for v in equity_curve:
+            peak = max(peak, v)
+            dd = (peak - v) / max(peak, EPSILON)
+            max_dd = max(max_dd, dd)
+        max_drawdown_pct = max_dd * 100.0
+
+    win_rate_pct = (wins / sell_count) * 100.0 if sell_count > 0 else 0.0
+    return {
+        "symbol": symbol,
+        "backtest_days": int(backtest_days),
+        "starting_cash": float(starting_cash),
+        "ending_equity": float(final_equity),
+        "total_return_pct": float(total_return_pct),
+        "max_drawdown_pct": float(max_drawdown_pct),
+        "win_rate_pct": float(win_rate_pct),
+        "trade_count": int(len(trades)),
+        "sell_count": int(sell_count),
+        "trades": trades[-50:],
+        "risk": {
+            "max_position_pct": float(max_position_pct),
+            "stop_loss_pct": float(stop_loss_pct),
+            "take_profit_pct": float(take_profit_pct),
+            "fee_bps": float(fee_bps),
+        },
+    }, None
 
 
 # Root route
@@ -642,6 +878,88 @@ def predict_crypto_batch():
             results.append(prediction)
 
     return jsonify({"results": results})
+
+
+@app.route('/trade/auto/decision', methods=['POST'])
+def trade_auto_decision():
+    payload, error = _get_json_or_error()
+    if error:
+        return error
+
+    symbol = str(payload.get('symbol', 'BTC-USD')).strip() or 'BTC-USD'
+    lookback_days = _parse_int(payload, "lookback_days", 365, 90, 3650)
+    sequence_length = _parse_int(payload, "sequence_length", 60, 20, 180)
+    epochs = _parse_int(payload, "epochs", 10, 1, 50)
+    batch_size = _parse_int(payload, "batch_size", 1, 1, 64)
+    horizon_days = _parse_int(payload, "horizon_days", 7, 1, 60)
+
+    max_position_pct = _parse_float(payload, "max_position_pct", 0.25, 0.01, 1.0)
+    stop_loss_pct = _parse_float(payload, "stop_loss_pct", 0.03, 0.001, 0.5)
+    take_profit_pct = _parse_float(payload, "take_profit_pct", 0.06, 0.001, 1.0)
+    fee_bps = _parse_float(payload, "fee_bps", 10.0, 0.0, 500.0)
+    context_limit = _parse_int(payload, "context_limit", 20, 1, 100)
+
+    prediction_payload, predict_error = run_single_prediction(
+        symbol=symbol,
+        include_market_context=False,
+        lookback_days=lookback_days,
+        sequence_length=sequence_length,
+        epochs=epochs,
+        batch_size=batch_size,
+        horizon_days=horizon_days,
+    )
+    if predict_error is not None:
+        return jsonify({"error": predict_error}), 400
+
+    market_context = load_rust_market_context(symbol, limit=context_limit)
+    decision = generate_auto_trade_decision(
+        symbol=symbol,
+        prediction_payload=prediction_payload,
+        market_context=market_context,
+        max_position_pct=max_position_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        fee_bps=fee_bps,
+    )
+
+    return jsonify(
+        {
+            "decision": decision,
+            "prediction": prediction_payload,
+            "market_context": market_context,
+        }
+    )
+
+
+@app.route('/trade/auto/backtest', methods=['POST'])
+def trade_auto_backtest():
+    payload, error = _get_json_or_error()
+    if error:
+        return error
+
+    symbol = str(payload.get('symbol', 'BTC-USD')).strip() or 'BTC-USD'
+    lookback_days = _parse_int(payload, "lookback_days", 365, 90, 3650)
+    backtest_days = _parse_int(payload, "backtest_days", 120, 30, 1000)
+    starting_cash = _parse_float(payload, "starting_cash", 10000.0, 100.0, 100000000.0)
+    max_position_pct = _parse_float(payload, "max_position_pct", 0.25, 0.01, 1.0)
+    stop_loss_pct = _parse_float(payload, "stop_loss_pct", 0.03, 0.001, 0.5)
+    take_profit_pct = _parse_float(payload, "take_profit_pct", 0.06, 0.001, 1.0)
+    fee_bps = _parse_float(payload, "fee_bps", 10.0, 0.0, 500.0)
+
+    backtest_result, backtest_error = run_paper_backtest(
+        symbol=symbol,
+        lookback_days=lookback_days,
+        backtest_days=backtest_days,
+        starting_cash=starting_cash,
+        max_position_pct=max_position_pct,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        fee_bps=fee_bps,
+    )
+    if backtest_error is not None:
+        return jsonify({"error": backtest_error}), 400
+
+    return jsonify(backtest_result)
 
 
 if __name__ == '__main__':
