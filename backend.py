@@ -1044,8 +1044,8 @@ def generate_auto_trade_decision(
         strategy_config=strategy_config,
     )
 
-    fee_pct = fee_bps / 10000.0
-    slippage_pct = slippage_bps / 10000.0
+    fee_pct = fee_bps / 100.0
+    slippage_pct = slippage_bps / 100.0
     forecast_volatility_pct = _estimate_forecast_volatility_pct(predictions)
     market_dna = _market_dna_fingerprint(expected_return_pct, forecast_volatility_pct, market_context)
     whale_signal = _detect_whale_activity(market_context)
