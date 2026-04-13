@@ -39,6 +39,15 @@ _proto_cache = {}
 _proto_cache_lock = threading.Lock()
 _decision_state = {}
 _decision_state_lock = threading.Lock()
+_strategy_performance_log = []
+_strategy_performance_lock = threading.Lock()
+
+MARKET_DNA_ARCHETYPES = {
+    "crash_like": {"volatility": 0.95, "trend": -0.95, "volume": 0.9, "sentiment": -0.95},
+    "risk_on_trend": {"volatility": 0.45, "trend": 0.85, "volume": 0.7, "sentiment": 0.8},
+    "mean_revert_chop": {"volatility": 0.35, "trend": 0.0, "volume": 0.3, "sentiment": 0.1},
+    "quiet_accumulation": {"volatility": 0.2, "trend": 0.35, "volume": 0.6, "sentiment": 0.4},
+}
 
 
 # LSTM Model for Prediction
@@ -737,6 +746,249 @@ def _estimate_forecast_volatility_pct(predictions):
     return float(np.std(returns) * 100.0)
 
 
+def _clip_unit(x):
+    return float(max(-1.0, min(1.0, x)))
+
+
+def _estimate_time_bucket(market_context):
+    latest_signals = market_context.get("latest_signals", []) if market_context else []
+    ts_ms = int(latest_signals[-1].get("signal_ts_ms", 0)) if latest_signals else 0
+    if ts_ms > 0:
+        hour = int(pd.to_datetime(ts_ms, unit="ms", utc=True).hour)
+    else:
+        hour = int(time.gmtime().tm_hour)
+    if 0 <= hour < 8:
+        return "asia_open"
+    if 8 <= hour < 16:
+        return "europe_session"
+    return "us_session"
+
+
+def _market_dna_fingerprint(expected_return_pct, forecast_volatility_pct, market_context):
+    latest_features = market_context.get("latest_features", []) if market_context else []
+    summary_sources = market_context.get("signal_summary", {}).get("sources", []) if market_context else []
+    volume_norm = 0.0
+    if latest_features:
+        volumes = [float(f.get("volume", 0.0)) for f in latest_features if float(f.get("volume", 0.0)) > 0.0]
+        if volumes:
+            v_last = volumes[-1]
+            v_avg = max(np.mean(volumes), EPSILON)
+            volume_norm = _clip_unit((v_last / v_avg) - 1.0)
+
+    bearish = sum(float(s.get("bearish", s.get("bearish_count", 0))) for s in summary_sources)
+    bullish = sum(float(s.get("bullish", s.get("bullish_count", 0))) for s in summary_sources)
+    sentiment_norm = _clip_unit((bullish - bearish) / max(1.0, bullish + bearish))
+    trend_norm = _clip_unit(expected_return_pct / 5.0)
+    volatility_norm = _clip_unit((forecast_volatility_pct - 1.0) / 3.0)
+
+    vector = {
+        "volatility": float(volatility_norm),
+        "trend": float(trend_norm),
+        "volume": float(volume_norm),
+        "sentiment": float(sentiment_norm),
+    }
+
+    best_name = "unknown"
+    best_dist = float("inf")
+    for name, dna in MARKET_DNA_ARCHETYPES.items():
+        dist = float(
+            np.sqrt(
+                (vector["volatility"] - dna["volatility"]) ** 2
+                + (vector["trend"] - dna["trend"]) ** 2
+                + (vector["volume"] - dna["volume"]) ** 2
+                + (vector["sentiment"] - dna["sentiment"]) ** 2
+            )
+        )
+        if dist < best_dist:
+            best_dist = dist
+            best_name = name
+
+    similarity = float(max(0.0, 1.0 - (best_dist / 3.0)))
+    return {"vector": vector, "closest_pattern": best_name, "similarity": similarity}
+
+
+def _detect_whale_activity(market_context):
+    latest_features = market_context.get("latest_features", []) if market_context else []
+    if len(latest_features) < 3:
+        return {"detected": False, "strength": 0.0, "signal": "none"}
+
+    volumes = [float(f.get("volume", 0.0)) for f in latest_features]
+    momentum = float(latest_features[-1].get("momentum", 0.0))
+    baseline = max(np.mean(volumes[:-1]), EPSILON)
+    spike = volumes[-1] / baseline
+    strength = float(max(0.0, min(1.0, (spike - 1.0) / 2.0)))
+    if spike >= 2.0 and momentum > 0:
+        return {"detected": True, "strength": strength, "signal": "accumulation"}
+    if spike >= 2.0 and momentum < 0:
+        return {"detected": True, "strength": strength, "signal": "distribution"}
+    return {"detected": False, "strength": strength, "signal": "none"}
+
+
+def _simulate_news_impact(market_context):
+    risk_score = _news_risk_score(market_context)
+    expected_move_pct = float(-2.5 * risk_score)
+    duration_hours = int(max(6, min(72, 12 + (abs(risk_score) * 48))))
+    impact = "low"
+    if abs(expected_move_pct) >= 1.75:
+        impact = "high"
+    elif abs(expected_move_pct) >= 0.75:
+        impact = "medium"
+    direction = "up" if expected_move_pct > 0 else "down" if expected_move_pct < 0 else "flat"
+    return {
+        "expected_move_pct": expected_move_pct,
+        "duration_hours": duration_hours,
+        "impact_level": impact,
+        "direction": direction,
+    }
+
+
+def _detect_macro_shock(market_context, forecast_volatility_pct):
+    news_risk = abs(_news_risk_score(market_context))
+    summary_sources = market_context.get("signal_summary", {}).get("sources", []) if market_context else []
+    total_signals = float(sum(float(s.get("total", s.get("total_signals", 0))) for s in summary_sources))
+    signal_pressure = min(1.0, total_signals / 30.0)
+    vol_pressure = min(1.0, forecast_volatility_pct / 4.0)
+    shock_score = float(min(1.0, (0.5 * news_risk) + (0.3 * vol_pressure) + (0.2 * signal_pressure)))
+    return {
+        "shock_score": shock_score,
+        "risk_off": bool(shock_score >= 0.65),
+    }
+
+
+def _market_emotion_index(forecast_volatility_pct, market_context, whale_signal):
+    news_risk = _news_risk_score(market_context)
+    fear = float(max(0.0, min(1.0, (forecast_volatility_pct / 4.0) + max(0.0, news_risk) * 0.7)))
+    greed = float(max(0.0, min(1.0, max(0.0, -news_risk) * 0.5 + whale_signal["strength"] * 0.5)))
+    emotion = "neutral"
+    if fear >= 0.6:
+        emotion = "fear"
+    elif greed >= 0.6:
+        emotion = "greed"
+    return {"fear": fear, "greed": greed, "state": emotion}
+
+
+def _select_regime(expected_return_pct, feature_hint, macro_shock, dna):
+    if macro_shock["risk_off"]:
+        return {"mode": "defensive", "reason": "macro_shock"}
+    if dna["closest_pattern"] == "crash_like" and dna["similarity"] > 0.55:
+        return {"mode": "no_trade", "reason": "crash_pattern_match"}
+    if abs(expected_return_pct) >= 1.25 and abs(feature_hint["momentum"]) > 0:
+        return {"mode": "trend", "reason": "strong_directional_signal"}
+    if feature_hint["rsi14"] <= 32 or feature_hint["rsi14"] >= 72:
+        return {"mode": "mean_reversion", "reason": "extreme_rsi"}
+    return {"mode": "no_trade", "reason": "mixed_or_weak_conditions"}
+
+
+def _multi_agent_vote(
+    expected_return_pct,
+    signal_hint,
+    rule_scores,
+    forecast_volatility_pct,
+    uncertainty_penalty,
+    whale_signal,
+    news_impact,
+    regime,
+    time_bucket,
+):
+    votes = {}
+
+    trend_score = expected_return_pct + (0.25 * signal_hint["confidence"]) + rule_scores.get("trend_following", 0.0)
+    votes["trend_agent"] = {"score": float(trend_score), "vote": "buy" if trend_score > 0.5 else "sell" if trend_score < -0.5 else "hold"}
+
+    news_score = float(news_impact["expected_move_pct"])
+    votes["news_agent"] = {"score": news_score, "vote": "buy" if news_score > 0.5 else "sell" if news_score < -0.5 else "hold"}
+
+    risk_score = float(-(forecast_volatility_pct + uncertainty_penalty))
+    votes["risk_agent"] = {"score": risk_score, "vote": "sell" if forecast_volatility_pct > 2.25 else "hold"}
+
+    volume_score = whale_signal["strength"] if whale_signal["signal"] == "accumulation" else -whale_signal["strength"] if whale_signal["signal"] == "distribution" else 0.0
+    votes["volume_agent"] = {"score": float(volume_score), "vote": "buy" if volume_score > 0.3 else "sell" if volume_score < -0.3 else "hold"}
+
+    time_bias = 0.0
+    if time_bucket == "us_session":
+        time_bias = 0.2
+    elif time_bucket == "asia_open":
+        time_bias = -0.05
+    if regime["mode"] == "defensive":
+        time_bias -= 0.3
+    votes["time_agent"] = {"score": float(time_bias), "vote": "buy" if time_bias > 0.15 else "hold"}
+
+    if regime["mode"] == "no_trade":
+        votes["regime_agent"] = {"score": -0.5, "vote": "hold"}
+    elif regime["mode"] == "trend":
+        votes["regime_agent"] = {"score": 0.6, "vote": "buy"}
+    elif regime["mode"] == "mean_reversion":
+        votes["regime_agent"] = {"score": 0.2, "vote": "hold"}
+    else:
+        votes["regime_agent"] = {"score": -0.3, "vote": "sell"}
+
+    counts = {"buy": 0, "sell": 0, "hold": 0}
+    for item in votes.values():
+        counts[item["vote"]] += 1
+
+    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    winner, winner_count = ranked[0]
+    runner_up = ranked[1][1]
+    margin = winner_count - runner_up
+    noisy = bool(winner == "hold" or margin <= 1)
+    final_action = "hold" if noisy else winner
+    return {"agents": votes, "counts": counts, "noise_detected": noisy, "final_action": final_action}
+
+
+def _build_confidence_engine(prediction_payload, market_context, vote_summary, macro_shock):
+    model_info = prediction_payload.get("model_info", {})
+    test_metrics = model_info.get("test_metrics", {})
+    mape = test_metrics.get("mape_pct")
+    mape_quality = 0.5 if mape is None else max(0.0, min(1.0, 1.0 - (float(mape) / 15.0)))
+
+    residual_std = float(model_info.get("residual_std", 0.0))
+    last_close = max(float(model_info.get("last_close", 1.0)), EPSILON)
+    residual_quality = max(0.0, min(1.0, 1.0 - (residual_std / (last_close * 0.08))))
+
+    latest_features = market_context.get("latest_features", []) if market_context else []
+    latest_signals = market_context.get("latest_signals", []) if market_context else []
+    data_quality = max(0.0, min(1.0, (len(latest_features) / 10.0) * 0.5 + (len(latest_signals) / 10.0) * 0.5))
+
+    counts = vote_summary["counts"]
+    vote_agreement = max(counts.values()) / max(1.0, sum(counts.values()))
+    shock_penalty = 0.3 if macro_shock["risk_off"] else 0.0
+    score = max(0.0, min(1.0, (0.35 * mape_quality) + (0.25 * residual_quality) + (0.25 * vote_agreement) + (0.15 * data_quality) - shock_penalty))
+    risk = "high" if score < 0.4 else "medium" if score < 0.7 else "low"
+    return {
+        "confidence_pct": float(score * 100.0),
+        "risk_level": risk,
+        "components": {
+            "mape_quality": float(mape_quality),
+            "residual_quality": float(residual_quality),
+            "data_quality": float(data_quality),
+            "vote_agreement": float(vote_agreement),
+        },
+    }
+
+
+def _adaptive_risk_controls(stop_loss_pct, take_profit_pct, forecast_volatility_pct, regime):
+    vol_multiplier = max(0.75, min(2.0, 1.0 + (forecast_volatility_pct / 3.0)))
+    regime_multiplier = 0.9 if regime["mode"] == "defensive" else 1.1 if regime["mode"] == "trend" else 1.0
+    adaptive_stop = max(0.005, min(0.2, stop_loss_pct * vol_multiplier * regime_multiplier))
+    adaptive_take = max(0.01, min(0.4, take_profit_pct * (1.0 + (forecast_volatility_pct / 5.0))))
+    return {"stop_loss_pct": float(adaptive_stop), "take_profit_pct": float(adaptive_take)}
+
+
+def _log_strategy_decision(symbol, action, confidence, regime, score):
+    event = {
+        "ts_ms": int(time.time() * 1000),
+        "symbol": symbol,
+        "action": action,
+        "confidence": float(confidence),
+        "regime": regime,
+        "score": float(score),
+    }
+    with _strategy_performance_lock:
+        _strategy_performance_log.append(event)
+        if len(_strategy_performance_log) > 1000:
+            del _strategy_performance_log[: len(_strategy_performance_log) - 1000]
+
+
 def generate_auto_trade_decision(
     symbol,
     prediction_payload,
@@ -774,6 +1026,7 @@ def generate_auto_trade_decision(
     strategy_config = _sanitize_strategy_config(strategy_config)
     signal_hint = _latest_signal_hint(market_context)
     feature_hint = _latest_feature_hint(market_context)
+    time_bucket = _estimate_time_bucket(market_context)
 
     rule_scores, rule_reasons, uncertainty_penalty = _compute_strategy_rule_scores(
         expected_return_pct=expected_return_pct,
@@ -787,6 +1040,12 @@ def generate_auto_trade_decision(
     fee_pct = fee_bps / 100.0
     slippage_pct = slippage_bps / 100.0
     forecast_volatility_pct = _estimate_forecast_volatility_pct(predictions)
+    market_dna = _market_dna_fingerprint(expected_return_pct, forecast_volatility_pct, market_context)
+    whale_signal = _detect_whale_activity(market_context)
+    news_impact = _simulate_news_impact(market_context)
+    macro_shock = _detect_macro_shock(market_context, forecast_volatility_pct)
+    emotion_index = _market_emotion_index(forecast_volatility_pct, market_context, whale_signal)
+    regime = _select_regime(expected_return_pct, feature_hint, macro_shock, market_dna)
 
     score = (
         sum(rule_scores.values())
@@ -798,8 +1057,20 @@ def generate_auto_trade_decision(
 
     raw_action, winning_rule = _resolve_rule_action(rule_scores, strategy_config)
     action, signal_controls = _apply_signal_controls(symbol, raw_action, strategy_config)
+    vote_summary = _multi_agent_vote(
+        expected_return_pct=expected_return_pct,
+        signal_hint=signal_hint,
+        rule_scores=rule_scores,
+        forecast_volatility_pct=forecast_volatility_pct,
+        uncertainty_penalty=uncertainty_penalty,
+        whale_signal=whale_signal,
+        news_impact=news_impact,
+        regime=regime,
+        time_bucket=time_bucket,
+    )
+    confidence_engine = _build_confidence_engine(prediction_payload, market_context, vote_summary, macro_shock)
 
-    confidence = max(0.0, min(1.0, 0.5 + (score / 10.0)))
+    confidence = max(0.0, min(1.0, (0.4 + (score / 12.0) + (confidence_engine["confidence_pct"] / 200.0))))
     vol_guard = max(forecast_volatility_pct / 100.0, 0.0025)
     vol_scaled_position_pct = risk_per_trade_pct / vol_guard
     loss_guard_position_pct = max_loss_per_trade_pct / max(stop_loss_pct, EPSILON)
@@ -807,13 +1078,33 @@ def generate_auto_trade_decision(
         0.0,
         min(max_position_pct, vol_scaled_position_pct, loss_guard_position_pct, max_position_pct * confidence),
     )
+    adaptive_risk = _adaptive_risk_controls(stop_loss_pct, take_profit_pct, forecast_volatility_pct, regime)
+    stop_loss_pct = adaptive_risk["stop_loss_pct"]
+    take_profit_pct = adaptive_risk["take_profit_pct"]
+
+    final_action = action
+    final_action_reason = "rule_engine"
+    if vote_summary["final_action"] == "hold":
+        final_action = "hold"
+        final_action_reason = "multi_agent_noise_filter"
+    elif final_action == "hold" and vote_summary["final_action"] in {"buy", "sell"}:
+        final_action = vote_summary["final_action"]
+        final_action_reason = "multi_agent_override"
+    if regime["mode"] in {"defensive", "no_trade"}:
+        final_action = "hold"
+        final_action_reason = f"regime_{regime['mode']}"
+    if confidence_engine["confidence_pct"] < 45.0:
+        final_action = "hold"
+        final_action_reason = "low_confidence_do_nothing_intelligence"
 
     stop_loss_price = float(max(0.0, current_price * (1.0 - stop_loss_pct)))
     take_profit_price = float(current_price * (1.0 + take_profit_pct))
+    _log_strategy_decision(symbol, final_action, confidence_engine["confidence_pct"], regime["mode"], score)
 
     return {
         "symbol": symbol,
-        "action": action,
+        "action": final_action,
+        "action_reason": final_action_reason,
         "score": float(score),
         "confidence": float(confidence),
         "expected_return_pct": float(expected_return_pct),
@@ -838,6 +1129,24 @@ def generate_auto_trade_decision(
             "rule_reasons": rule_reasons,
             "controls": signal_controls,
             "config": strategy_config,
+        },
+        "intelligence": {
+            "market_dna": market_dna,
+            "regime": regime,
+            "whale_tracker": whale_signal,
+            "news_impact_simulator": news_impact,
+            "macro_shock": macro_shock,
+            "market_emotion_index": emotion_index,
+            "time_bucket": time_bucket,
+            "multi_agent": vote_summary,
+            "confidence_engine": confidence_engine,
+            "fake_signal_filter": {"rejected": bool(vote_summary["noise_detected"]), "reason": "conflicted_agents" if vote_summary["noise_detected"] else "passed"},
+            "explainability": [
+                f"Rule engine winner: {winning_rule}",
+                f"Regime mode: {regime['mode']} ({regime['reason']})",
+                f"Market DNA match: {market_dna['closest_pattern']} ({market_dna['similarity']:.2f})",
+                f"News impact estimate: {news_impact['direction']} {news_impact['expected_move_pct']:.2f}% in {news_impact['duration_hours']}h",
+            ],
         },
         "signals": {
             "recommendation": signal_hint["recommendation"],
@@ -1187,6 +1496,86 @@ def trade_auto_strategy_validate():
         return error
     strategy_config = _sanitize_strategy_config(payload.get("strategy_config", {}))
     return jsonify({"valid": True, "strategy_config": strategy_config})
+
+
+@app.route('/trade/auto/intelligence', methods=['POST'])
+def trade_auto_intelligence():
+    payload, error = _get_json_or_error()
+    if error:
+        return error
+
+    symbol = str(payload.get('symbol', 'BTC-USD')).strip() or 'BTC-USD'
+    lookback_days = _parse_int(payload, "lookback_days", 365, 90, 3650)
+    sequence_length = _parse_int(payload, "sequence_length", 60, 20, 180)
+    epochs = _parse_int(payload, "epochs", 10, 1, 50)
+    batch_size = _parse_int(payload, "batch_size", 1, 1, 64)
+    horizon_days = _parse_int(payload, "horizon_days", 7, 1, 60)
+    context_limit = _parse_int(payload, "context_limit", 20, 1, 100)
+
+    prediction_payload, predict_error = run_single_prediction(
+        symbol=symbol,
+        include_market_context=False,
+        lookback_days=lookback_days,
+        sequence_length=sequence_length,
+        epochs=epochs,
+        batch_size=batch_size,
+        horizon_days=horizon_days,
+    )
+    if predict_error is not None:
+        return jsonify({"error": predict_error}), 400
+
+    market_context = load_rust_market_context(symbol, limit=context_limit)
+    decision = generate_auto_trade_decision(
+        symbol=symbol,
+        prediction_payload=prediction_payload,
+        market_context=market_context,
+    )
+    return jsonify(
+        {
+            "symbol": symbol,
+            "intelligence": decision.get("intelligence", {}),
+            "decision_preview": {
+                "action": decision.get("action"),
+                "action_reason": decision.get("action_reason"),
+                "confidence": decision.get("intelligence", {}).get("confidence_engine", {}).get("confidence_pct"),
+                "risk_level": decision.get("intelligence", {}).get("confidence_engine", {}).get("risk_level"),
+            },
+        }
+    )
+
+
+@app.route('/trade/auto/performance', methods=['GET'])
+def trade_auto_performance():
+    symbol = str(request.args.get("symbol", "")).strip().upper()
+    limit = _parse_int(request.args, "limit", 100, 1, 500)
+    with _strategy_performance_lock:
+        records = _strategy_performance_log[-limit:]
+    if symbol:
+        records = [r for r in records if str(r.get("symbol", "")).upper() == symbol]
+
+    total = len(records)
+    actions = {"buy": 0, "sell": 0, "hold": 0}
+    avg_confidence = 0.0
+    regime_counts = {}
+    for r in records:
+        action = str(r.get("action", "hold"))
+        actions[action] = actions.get(action, 0) + 1
+        regime = str(r.get("regime", "unknown"))
+        regime_counts[regime] = regime_counts.get(regime, 0) + 1
+        avg_confidence += float(r.get("confidence", 0.0))
+    if total > 0:
+        avg_confidence /= total
+
+    return jsonify(
+        {
+            "symbol_filter": symbol or None,
+            "total_records": total,
+            "avg_confidence": float(avg_confidence),
+            "actions": actions,
+            "regimes": regime_counts,
+            "recent": records[-50:],
+        }
+    )
 
 
 @app.route('/trade/auto/decision', methods=['POST'])

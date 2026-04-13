@@ -145,6 +145,22 @@ The Flask API can now include Rust-generated context in prediction responses.
       - `buy_threshold`, `sell_threshold`
       - `cooldown_minutes`, `debounce_count`
 
+- `POST /trade/auto/intelligence`
+  - Runs the innovation/intelligence layer without executing backtest:
+    - Market DNA fingerprint match
+    - AI regime switcher (trend / mean-reversion / defensive / no-trade)
+    - Whale tracker (volume burst + momentum)
+    - News impact simulator (estimated move + duration)
+    - Macro shock detector and market emotion index
+    - Multi-agent vote summary + fake-signal/noise filter
+    - Confidence/risk score engine
+
+- `GET /trade/auto/performance`
+  - Returns strategy decision telemetry from recent auto-decision calls.
+  - Query params:
+    - `symbol` (optional)
+    - `limit` (optional, default `100`, max `500`)
+
 - `POST /trade/auto/decision`
   - Generates a risk-aware trade action (`buy` / `sell` / `hold`) from:
     - model forecast + uncertainty bands
@@ -157,6 +173,17 @@ The Flask API can now include Rust-generated context in prediction responses.
     - `context_limit` (optional, default `20`)
   - Response includes:
     - `decision` (score, confidence, rule scores, debounce/cooldown controls, suggested position, stop/take-profit prices)
+    - innovation payload:
+      - `intelligence.market_dna`
+      - `intelligence.regime`
+      - `intelligence.whale_tracker`
+      - `intelligence.news_impact_simulator`
+      - `intelligence.macro_shock`
+      - `intelligence.market_emotion_index`
+      - `intelligence.multi_agent`
+      - `intelligence.fake_signal_filter`
+      - `intelligence.confidence_engine`
+      - `intelligence.explainability`
     - `prediction`
     - `market_context`
 
