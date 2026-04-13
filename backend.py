@@ -619,8 +619,8 @@ def _news_risk_score(market_context):
     if not sources:
         return 0.0
 
-    bearish = sum(float(s.get("bearish_count", 0)) for s in sources)
-    bullish = sum(float(s.get("bullish_count", 0)) for s in sources)
+    bearish = sum(float(s.get("bearish", s.get("bearish_count", 0))) for s in sources)
+    bullish = sum(float(s.get("bullish", s.get("bullish_count", 0))) for s in sources)
     total = max(1.0, bearish + bullish)
     return float((bearish - bullish) / total)
 
