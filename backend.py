@@ -37,6 +37,8 @@ _model_cache = {}
 _model_cache_lock = threading.Lock()
 _proto_cache = {}
 _proto_cache_lock = threading.Lock()
+_decision_state = {}
+_decision_state_lock = threading.Lock()
 
 
 # LSTM Model for Prediction
@@ -568,6 +570,173 @@ def _latest_feature_hint(market_context):
     }
 
 
+def _sanitize_strategy_config(raw_config):
+    config = raw_config if isinstance(raw_config, dict) else {}
+    enabled_rules = config.get("enabled_rules", {})
+    if not isinstance(enabled_rules, dict):
+        enabled_rules = {}
+
+    default_priority = ["trend_following", "mean_reversion", "risk_off_news"]
+    rule_priority = config.get("rule_priority", default_priority)
+    if not isinstance(rule_priority, list):
+        rule_priority = default_priority
+    rule_priority = [str(x) for x in rule_priority if str(x) in default_priority] or default_priority
+
+    try:
+        buy_threshold = float(config.get("buy_threshold", 1.0))
+    except (TypeError, ValueError):
+        buy_threshold = 1.0
+    try:
+        sell_threshold = float(config.get("sell_threshold", -1.0))
+    except (TypeError, ValueError):
+        sell_threshold = -1.0
+    try:
+        cooldown_minutes = int(config.get("cooldown_minutes", 60))
+    except (TypeError, ValueError):
+        cooldown_minutes = 60
+    try:
+        debounce_count = int(config.get("debounce_count", 2))
+    except (TypeError, ValueError):
+        debounce_count = 2
+
+    return {
+        "enabled_rules": {
+            "trend_following": bool(enabled_rules.get("trend_following", True)),
+            "mean_reversion": bool(enabled_rules.get("mean_reversion", True)),
+            "risk_off_news": bool(enabled_rules.get("risk_off_news", True)),
+        },
+        "rule_priority": rule_priority,
+        "buy_threshold": max(0.2, min(5.0, buy_threshold)),
+        "sell_threshold": min(-0.2, max(-5.0, sell_threshold)),
+        "cooldown_minutes": max(0, min(1440, cooldown_minutes)),
+        "debounce_count": max(1, min(5, debounce_count)),
+    }
+
+
+def _news_risk_score(market_context):
+    summary = market_context.get("signal_summary", {}) if market_context else {}
+    sources = summary.get("sources", [])
+    if not sources:
+        return 0.0
+
+    bearish = sum(float(s.get("bearish_count", 0)) for s in sources)
+    bullish = sum(float(s.get("bullish_count", 0)) for s in sources)
+    total = max(1.0, bearish + bullish)
+    return float((bearish - bullish) / total)
+
+
+def _compute_strategy_rule_scores(
+    expected_return_pct,
+    avg_band_width_pct,
+    signal_hint,
+    feature_hint,
+    market_context,
+    strategy_config,
+):
+    scores = {}
+    reasons = {}
+    enabled = strategy_config["enabled_rules"]
+
+    trend_score = expected_return_pct + (0.3 * signal_hint["confidence"])
+    if signal_hint["recommendation"] == "bearish":
+        trend_score -= 0.6
+    if not enabled["trend_following"]:
+        trend_score = 0.0
+    scores["trend_following"] = trend_score
+    reasons["trend_following"] = "forecast + signal alignment"
+
+    rsi = feature_hint["rsi14"]
+    mean_reversion_score = 0.0
+    if rsi <= 30:
+        mean_reversion_score = 1.2
+    elif rsi >= 75:
+        mean_reversion_score = -1.2
+    if not enabled["mean_reversion"]:
+        mean_reversion_score = 0.0
+    scores["mean_reversion"] = mean_reversion_score
+    reasons["mean_reversion"] = "RSI overbought/oversold reversion"
+
+    risk_off = _news_risk_score(market_context)
+    risk_off_news_score = -1.5 * max(0.0, risk_off)
+    if signal_hint["recommendation"] == "bullish":
+        risk_off_news_score += 0.2
+    if not enabled["risk_off_news"]:
+        risk_off_news_score = 0.0
+    scores["risk_off_news"] = risk_off_news_score
+    reasons["risk_off_news"] = "market-wide bearish pressure"
+
+    uncertainty_penalty = min(2.0, avg_band_width_pct * 0.25)
+    return scores, reasons, float(uncertainty_penalty)
+
+
+def _resolve_rule_action(rule_scores, strategy_config):
+    ordered = strategy_config["rule_priority"]
+    top_rule = ordered[0]
+    top_score = rule_scores.get(top_rule, 0.0)
+    for rule_name in ordered:
+        score = rule_scores.get(rule_name, 0.0)
+        if abs(score) > abs(top_score):
+            top_rule = rule_name
+            top_score = score
+
+    if top_score >= strategy_config["buy_threshold"]:
+        return "buy", top_rule
+    if top_score <= strategy_config["sell_threshold"]:
+        return "sell", top_rule
+    return "hold", top_rule
+
+
+def _apply_signal_controls(symbol, raw_action, strategy_config):
+    if raw_action == "hold":
+        return "hold", {"raw_action": raw_action, "debounced": False, "cooldown_active": False}
+
+    now = time.time()
+    cooldown_seconds = strategy_config["cooldown_minutes"] * 60
+    debounce_count = strategy_config["debounce_count"]
+
+    with _decision_state_lock:
+        state = _decision_state.get(
+            symbol,
+            {"last_raw_action": None, "same_count": 0, "last_action": "hold", "last_action_ts": 0.0},
+        )
+
+        if state["last_raw_action"] == raw_action:
+            state["same_count"] += 1
+        else:
+            state["last_raw_action"] = raw_action
+            state["same_count"] = 1
+
+        debounced = state["same_count"] >= debounce_count
+        cooldown_active = (
+            state["last_action"] != "hold"
+            and state["last_action"] != raw_action
+            and (now - state["last_action_ts"]) < cooldown_seconds
+        )
+
+        action = raw_action if debounced and not cooldown_active else "hold"
+        if action != "hold":
+            state["last_action"] = action
+            state["last_action_ts"] = now
+
+        _decision_state[symbol] = state
+
+    return action, {
+        "raw_action": raw_action,
+        "debounced": debounced,
+        "cooldown_active": cooldown_active,
+        "same_signal_count": state["same_count"],
+    }
+
+
+def _estimate_forecast_volatility_pct(predictions):
+    if not predictions or len(predictions) < 2:
+        return 0.0
+    arr = np.array(predictions, dtype=float)
+    prev = np.maximum(arr[:-1], EPSILON)
+    returns = (arr[1:] - arr[:-1]) / prev
+    return float(np.std(returns) * 100.0)
+
+
 def generate_auto_trade_decision(
     symbol,
     prediction_payload,
@@ -576,6 +745,10 @@ def generate_auto_trade_decision(
     stop_loss_pct=0.03,
     take_profit_pct=0.06,
     fee_bps=10.0,
+    slippage_bps=5.0,
+    risk_per_trade_pct=0.01,
+    max_loss_per_trade_pct=0.02,
+    strategy_config=None,
 ):
     predictions = prediction_payload.get("predictions", [])
     bands = prediction_payload.get("confidence_bands", [])
@@ -598,30 +771,42 @@ def generate_auto_trade_decision(
         if widths:
             avg_band_width_pct = float(np.mean(widths))
 
+    strategy_config = _sanitize_strategy_config(strategy_config)
     signal_hint = _latest_signal_hint(market_context)
     feature_hint = _latest_feature_hint(market_context)
 
-    signal_bonus = 0.0
-    if signal_hint["recommendation"] == "bullish":
-        signal_bonus = 0.5 * signal_hint["confidence"]
-    elif signal_hint["recommendation"] == "bearish":
-        signal_bonus = -0.5 * signal_hint["confidence"]
+    rule_scores, rule_reasons, uncertainty_penalty = _compute_strategy_rule_scores(
+        expected_return_pct=expected_return_pct,
+        avg_band_width_pct=avg_band_width_pct,
+        signal_hint=signal_hint,
+        feature_hint=feature_hint,
+        market_context=market_context,
+        strategy_config=strategy_config,
+    )
 
-    momentum_bonus = 0.1 if feature_hint["momentum"] > 0 else -0.1 if feature_hint["momentum"] < 0 else 0.0
-    rsi_penalty = 0.15 if feature_hint["rsi14"] > 72 else -0.05 if feature_hint["rsi14"] < 35 else 0.0
     fee_pct = fee_bps / 100.0
-    uncertainty_penalty = min(1.5, avg_band_width_pct * 0.2)
+    slippage_pct = slippage_bps / 100.0
+    forecast_volatility_pct = _estimate_forecast_volatility_pct(predictions)
 
-    score = expected_return_pct - fee_pct - uncertainty_penalty + signal_bonus + momentum_bonus - rsi_penalty
+    score = (
+        sum(rule_scores.values())
+        - fee_pct
+        - slippage_pct
+        - uncertainty_penalty
+        + (0.05 if feature_hint["momentum"] > 0 else -0.05 if feature_hint["momentum"] < 0 else 0.0)
+    )
 
-    action = "hold"
-    if score >= 1.0:
-        action = "buy"
-    elif score <= -1.0:
-        action = "sell"
+    raw_action, winning_rule = _resolve_rule_action(rule_scores, strategy_config)
+    action, signal_controls = _apply_signal_controls(symbol, raw_action, strategy_config)
 
     confidence = max(0.0, min(1.0, 0.5 + (score / 10.0)))
-    suggested_position_pct = max(0.0, min(max_position_pct, max_position_pct * confidence))
+    vol_guard = max(forecast_volatility_pct / 100.0, 0.0025)
+    vol_scaled_position_pct = risk_per_trade_pct / vol_guard
+    loss_guard_position_pct = max_loss_per_trade_pct / max(stop_loss_pct, EPSILON)
+    suggested_position_pct = max(
+        0.0,
+        min(max_position_pct, vol_scaled_position_pct, loss_guard_position_pct, max_position_pct * confidence),
+    )
 
     stop_loss_price = float(max(0.0, current_price * (1.0 - stop_loss_pct)))
     take_profit_price = float(current_price * (1.0 + take_profit_pct))
@@ -633,14 +818,26 @@ def generate_auto_trade_decision(
         "confidence": float(confidence),
         "expected_return_pct": float(expected_return_pct),
         "avg_band_width_pct": float(avg_band_width_pct),
+        "forecast_volatility_pct": float(forecast_volatility_pct),
         "risk": {
             "max_position_pct": float(max_position_pct),
             "suggested_position_pct": float(suggested_position_pct),
+            "risk_per_trade_pct": float(risk_per_trade_pct),
+            "max_loss_per_trade_pct": float(max_loss_per_trade_pct),
             "stop_loss_pct": float(stop_loss_pct),
             "take_profit_pct": float(take_profit_pct),
             "fee_bps": float(fee_bps),
+            "slippage_bps": float(slippage_bps),
             "stop_loss_price": stop_loss_price,
             "take_profit_price": take_profit_price,
+        },
+        "strategy": {
+            "winning_rule": winning_rule,
+            "rule_priority": strategy_config["rule_priority"],
+            "rule_scores": {k: float(v) for k, v in rule_scores.items()},
+            "rule_reasons": rule_reasons,
+            "controls": signal_controls,
+            "config": strategy_config,
         },
         "signals": {
             "recommendation": signal_hint["recommendation"],
@@ -648,6 +845,57 @@ def generate_auto_trade_decision(
             "momentum": feature_hint["momentum"],
             "rsi14": feature_hint["rsi14"],
         },
+    }
+
+
+def _compute_backtest_metrics(equity_curve, starting_cash, final_equity, closed_trade_pnls):
+    total_return_pct = ((final_equity - starting_cash) / max(starting_cash, EPSILON)) * 100.0
+    max_drawdown_pct = 0.0
+    if equity_curve:
+        peak = equity_curve[0]
+        max_dd = 0.0
+        for v in equity_curve:
+            peak = max(peak, v)
+            dd = (peak - v) / max(peak, EPSILON)
+            max_dd = max(max_dd, dd)
+        max_drawdown_pct = max_dd * 100.0
+
+    daily_returns = []
+    if len(equity_curve) > 1:
+        eq = np.array(equity_curve, dtype=float)
+        prev = np.maximum(eq[:-1], EPSILON)
+        daily_returns = ((eq[1:] - eq[:-1]) / prev).tolist()
+
+    years = max(1.0 / 365.0, len(equity_curve) / 365.0)
+    cagr_pct = ((final_equity / max(starting_cash, EPSILON)) ** (1.0 / years) - 1.0) * 100.0
+
+    sharpe = 0.0
+    sortino = 0.0
+    if daily_returns:
+        r = np.array(daily_returns, dtype=float)
+        std = float(np.std(r))
+        if std > EPSILON:
+            sharpe = float((np.mean(r) / std) * np.sqrt(365.0))
+        downside = r[r < 0]
+        dstd = float(np.std(downside)) if len(downside) > 0 else 0.0
+        if dstd > EPSILON:
+            sortino = float((np.mean(r) / dstd) * np.sqrt(365.0))
+
+    wins = [p for p in closed_trade_pnls if p > 0]
+    losses = [p for p in closed_trade_pnls if p < 0]
+    avg_win = float(np.mean(wins)) if wins else 0.0
+    avg_loss = float(np.mean(losses)) if losses else 0.0
+    win_rate_pct = (len(wins) / max(1, len(closed_trade_pnls))) * 100.0
+
+    return {
+        "total_return_pct": float(total_return_pct),
+        "cagr_pct": float(cagr_pct),
+        "max_drawdown_pct": float(max_drawdown_pct),
+        "sharpe": float(sharpe),
+        "sortino": float(sortino),
+        "win_rate_pct": float(win_rate_pct),
+        "avg_win": float(avg_win),
+        "avg_loss": float(avg_loss),
     }
 
 
@@ -660,6 +908,13 @@ def run_paper_backtest(
     stop_loss_pct=0.03,
     take_profit_pct=0.06,
     fee_bps=10.0,
+    slippage_bps=5.0,
+    max_drawdown_cutoff_pct=25.0,
+    risk_per_trade_pct=0.01,
+    max_loss_per_trade_pct=0.02,
+    latency_bars=0,
+    partial_fill_ratio=1.0,
+    order_type="market",
 ):
     close_series = fetch_historical_crypto_data(symbol, lookback_days=lookback_days)
     if close_series is None or len(close_series) < 60:
@@ -677,38 +932,61 @@ def run_paper_backtest(
     df["rsi"] = df["rsi"].fillna(50.0)
 
     fee_rate = fee_bps / 10000.0
+    slippage_rate = slippage_bps / 10000.0
+    partial_fill_ratio = max(0.1, min(1.0, float(partial_fill_ratio)))
+    latency_bars = max(0, min(5, int(latency_bars)))
+    order_type = str(order_type).lower()
+    if order_type not in {"market", "limit"}:
+        order_type = "market"
+
     cash = float(starting_cash)
     units = 0.0
     entry_price = None
     trades = []
     equity_curve = []
-    wins = 0
-    sell_count = 0
+    closed_trade_pnls = []
+    max_equity_seen = float(starting_cash)
+    halted_by_drawdown = False
 
     for i in range(1, len(df)):
-        row = df.iloc[i]
+        exec_i = min(len(df) - 1, i + latency_bars)
+        row = df.iloc[exec_i]
         price = float(row["close"])
         equity = cash + units * price
         equity_curve.append(equity)
+        max_equity_seen = max(max_equity_seen, equity)
+        current_drawdown_pct = ((max_equity_seen - equity) / max(max_equity_seen, EPSILON)) * 100.0
+        if current_drawdown_pct >= max_drawdown_cutoff_pct:
+            halted_by_drawdown = True
+            if units > 0.0:
+                sell_price = price * (1.0 - slippage_rate)
+                proceeds = units * sell_price * (1.0 - fee_rate)
+                pnl = proceeds - (units * (entry_price if entry_price is not None else sell_price))
+                cash += proceeds
+                trades.append({"side": "sell", "price": float(sell_price), "reason": "drawdown_cutoff", "pnl": float(pnl)})
+                closed_trade_pnls.append(float(pnl))
+                units = 0.0
+                entry_price = None
+            break
 
         if units > 0.0 and entry_price is not None:
             if price <= entry_price * (1.0 - stop_loss_pct):
-                proceeds = units * price * (1.0 - fee_rate)
+                sell_price = price * (1.0 - slippage_rate)
+                proceeds = units * sell_price * (1.0 - fee_rate)
                 pnl = proceeds - (units * entry_price)
                 cash += proceeds
-                trades.append({"side": "sell", "price": price, "reason": "stop_loss", "pnl": float(pnl)})
-                wins += 1 if pnl > 0 else 0
-                sell_count += 1
+                trades.append({"side": "sell", "price": float(sell_price), "reason": "stop_loss", "pnl": float(pnl)})
+                closed_trade_pnls.append(float(pnl))
                 units = 0.0
                 entry_price = None
                 continue
             if price >= entry_price * (1.0 + take_profit_pct):
-                proceeds = units * price * (1.0 - fee_rate)
+                sell_price = price * (1.0 - slippage_rate)
+                proceeds = units * sell_price * (1.0 - fee_rate)
                 pnl = proceeds - (units * entry_price)
                 cash += proceeds
-                trades.append({"side": "sell", "price": price, "reason": "take_profit", "pnl": float(pnl)})
-                wins += 1 if pnl > 0 else 0
-                sell_count += 1
+                trades.append({"side": "sell", "price": float(sell_price), "reason": "take_profit", "pnl": float(pnl)})
+                closed_trade_pnls.append(float(pnl))
                 units = 0.0
                 entry_price = None
                 continue
@@ -718,56 +996,78 @@ def run_paper_backtest(
 
         if units <= 0.0 and bullish:
             equity = cash
-            budget = equity * max_position_pct
+            volatility_pct = float(df["close"].pct_change().rolling(14).std().iloc[exec_i] * 100.0)
+            volatility_pct = max(0.2, volatility_pct if np.isfinite(volatility_pct) else 0.2)
+            vol_position_cap = risk_per_trade_pct / max(volatility_pct / 100.0, EPSILON)
+            loss_cap = max_loss_per_trade_pct / max(stop_loss_pct, EPSILON)
+            budget = equity * min(max_position_pct, vol_position_cap, loss_cap)
             if budget > 0.0:
-                buy_units = (budget * (1.0 - fee_rate)) / max(price, EPSILON)
-                cost = buy_units * price
+                if order_type == "market":
+                    buy_price = price * (1.0 + slippage_rate)
+                else:
+                    buy_price = price * (1.0 - (slippage_rate * 0.5))
+                buy_units = ((budget * (1.0 - fee_rate)) / max(buy_price, EPSILON)) * partial_fill_ratio
+                cost = buy_units * buy_price
                 cash -= cost
                 units += buy_units
-                entry_price = price
-                trades.append({"side": "buy", "price": price, "reason": "bullish_cross", "units": float(buy_units)})
+                entry_price = buy_price
+                trades.append(
+                    {
+                        "side": "buy",
+                        "price": float(buy_price),
+                        "reason": "bullish_cross",
+                        "units": float(buy_units),
+                        "partial_fill_ratio": float(partial_fill_ratio),
+                        "order_type": order_type,
+                    }
+                )
         elif units > 0.0 and bearish:
-            proceeds = units * price * (1.0 - fee_rate)
+            sell_price = price * (1.0 - slippage_rate) if order_type == "market" else price * (1.0 + (slippage_rate * 0.5))
+            proceeds = units * sell_price * (1.0 - fee_rate)
             pnl = proceeds - (units * (entry_price if entry_price is not None else price))
             cash += proceeds
-            trades.append({"side": "sell", "price": price, "reason": "bearish_cross", "pnl": float(pnl)})
-            wins += 1 if pnl > 0 else 0
-            sell_count += 1
+            trades.append({"side": "sell", "price": float(sell_price), "reason": "bearish_cross", "pnl": float(pnl), "order_type": order_type})
+            closed_trade_pnls.append(float(pnl))
             units = 0.0
             entry_price = None
 
     final_price = float(df.iloc[-1]["close"])
     final_equity = cash + units * final_price
-    start_equity = float(starting_cash)
-    total_return_pct = ((final_equity - start_equity) / max(start_equity, EPSILON)) * 100.0
-
-    max_drawdown_pct = 0.0
-    if equity_curve:
-        peak = equity_curve[0]
-        max_dd = 0.0
-        for v in equity_curve:
-            peak = max(peak, v)
-            dd = (peak - v) / max(peak, EPSILON)
-            max_dd = max(max_dd, dd)
-        max_drawdown_pct = max_dd * 100.0
-
-    win_rate_pct = (wins / sell_count) * 100.0 if sell_count > 0 else 0.0
+    metrics = _compute_backtest_metrics(
+        equity_curve=equity_curve,
+        starting_cash=float(starting_cash),
+        final_equity=float(final_equity),
+        closed_trade_pnls=closed_trade_pnls,
+    )
     return {
         "symbol": symbol,
         "backtest_days": int(backtest_days),
         "starting_cash": float(starting_cash),
         "ending_equity": float(final_equity),
-        "total_return_pct": float(total_return_pct),
-        "max_drawdown_pct": float(max_drawdown_pct),
-        "win_rate_pct": float(win_rate_pct),
+        "total_return_pct": metrics["total_return_pct"],
+        "cagr_pct": metrics["cagr_pct"],
+        "max_drawdown_pct": metrics["max_drawdown_pct"],
+        "sharpe": metrics["sharpe"],
+        "sortino": metrics["sortino"],
+        "win_rate_pct": metrics["win_rate_pct"],
+        "avg_win": metrics["avg_win"],
+        "avg_loss": metrics["avg_loss"],
         "trade_count": int(len(trades)),
-        "sell_count": int(sell_count),
+        "sell_count": int(len(closed_trade_pnls)),
+        "halted_by_drawdown": bool(halted_by_drawdown),
         "trades": trades[-50:],
         "risk": {
             "max_position_pct": float(max_position_pct),
+            "risk_per_trade_pct": float(risk_per_trade_pct),
+            "max_loss_per_trade_pct": float(max_loss_per_trade_pct),
             "stop_loss_pct": float(stop_loss_pct),
             "take_profit_pct": float(take_profit_pct),
+            "max_drawdown_cutoff_pct": float(max_drawdown_cutoff_pct),
             "fee_bps": float(fee_bps),
+            "slippage_bps": float(slippage_bps),
+            "latency_bars": int(latency_bars),
+            "partial_fill_ratio": float(partial_fill_ratio),
+            "order_type": order_type,
         },
     }, None
 
@@ -880,6 +1180,15 @@ def predict_crypto_batch():
     return jsonify({"results": results})
 
 
+@app.route('/trade/auto/strategy/validate', methods=['POST'])
+def trade_auto_strategy_validate():
+    payload, error = _get_json_or_error()
+    if error:
+        return error
+    strategy_config = _sanitize_strategy_config(payload.get("strategy_config", {}))
+    return jsonify({"valid": True, "strategy_config": strategy_config})
+
+
 @app.route('/trade/auto/decision', methods=['POST'])
 def trade_auto_decision():
     payload, error = _get_json_or_error()
@@ -897,7 +1206,11 @@ def trade_auto_decision():
     stop_loss_pct = _parse_float(payload, "stop_loss_pct", 0.03, 0.001, 0.5)
     take_profit_pct = _parse_float(payload, "take_profit_pct", 0.06, 0.001, 1.0)
     fee_bps = _parse_float(payload, "fee_bps", 10.0, 0.0, 500.0)
+    slippage_bps = _parse_float(payload, "slippage_bps", 5.0, 0.0, 500.0)
+    risk_per_trade_pct = _parse_float(payload, "risk_per_trade_pct", 0.01, 0.001, 0.2)
+    max_loss_per_trade_pct = _parse_float(payload, "max_loss_per_trade_pct", 0.02, 0.001, 0.5)
     context_limit = _parse_int(payload, "context_limit", 20, 1, 100)
+    strategy_config = payload.get("strategy_config", {})
 
     prediction_payload, predict_error = run_single_prediction(
         symbol=symbol,
@@ -920,6 +1233,10 @@ def trade_auto_decision():
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct,
         fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_loss_per_trade_pct=max_loss_per_trade_pct,
+        strategy_config=strategy_config,
     )
 
     return jsonify(
@@ -945,6 +1262,13 @@ def trade_auto_backtest():
     stop_loss_pct = _parse_float(payload, "stop_loss_pct", 0.03, 0.001, 0.5)
     take_profit_pct = _parse_float(payload, "take_profit_pct", 0.06, 0.001, 1.0)
     fee_bps = _parse_float(payload, "fee_bps", 10.0, 0.0, 500.0)
+    slippage_bps = _parse_float(payload, "slippage_bps", 5.0, 0.0, 500.0)
+    max_drawdown_cutoff_pct = _parse_float(payload, "max_drawdown_cutoff_pct", 25.0, 1.0, 95.0)
+    risk_per_trade_pct = _parse_float(payload, "risk_per_trade_pct", 0.01, 0.001, 0.2)
+    max_loss_per_trade_pct = _parse_float(payload, "max_loss_per_trade_pct", 0.02, 0.001, 0.5)
+    latency_bars = _parse_int(payload, "latency_bars", 0, 0, 5)
+    partial_fill_ratio = _parse_float(payload, "partial_fill_ratio", 1.0, 0.1, 1.0)
+    order_type = str(payload.get("order_type", "market")).strip().lower()
 
     backtest_result, backtest_error = run_paper_backtest(
         symbol=symbol,
@@ -955,6 +1279,13 @@ def trade_auto_backtest():
         stop_loss_pct=stop_loss_pct,
         take_profit_pct=take_profit_pct,
         fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        max_drawdown_cutoff_pct=max_drawdown_cutoff_pct,
+        risk_per_trade_pct=risk_per_trade_pct,
+        max_loss_per_trade_pct=max_loss_per_trade_pct,
+        latency_bars=latency_bars,
+        partial_fill_ratio=partial_fill_ratio,
+        order_type=order_type,
     )
     if backtest_error is not None:
         return jsonify({"error": backtest_error}), 400

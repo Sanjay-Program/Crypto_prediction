@@ -136,6 +136,15 @@ The Flask API can now include Rust-generated context in prediction responses.
 
 ## Auto-trading APIs
 
+- `POST /trade/auto/strategy/validate`
+  - Validates and normalizes strategy rule configuration.
+  - Request fields:
+    - `strategy_config` (optional object)
+      - `enabled_rules`: `trend_following`, `mean_reversion`, `risk_off_news`
+      - `rule_priority`: ordered list of rule names
+      - `buy_threshold`, `sell_threshold`
+      - `cooldown_minutes`, `debounce_count`
+
 - `POST /trade/auto/decision`
   - Generates a risk-aware trade action (`buy` / `sell` / `hold`) from:
     - model forecast + uncertainty bands
@@ -143,10 +152,11 @@ The Flask API can now include Rust-generated context in prediction responses.
   - Request fields:
     - `symbol` (optional, default `BTC-USD`)
     - optional prediction controls: `lookback_days`, `sequence_length`, `epochs`, `batch_size`, `horizon_days`
-    - optional risk controls: `max_position_pct`, `stop_loss_pct`, `take_profit_pct`, `fee_bps`
+    - optional risk controls: `max_position_pct`, `risk_per_trade_pct`, `max_loss_per_trade_pct`, `stop_loss_pct`, `take_profit_pct`, `fee_bps`, `slippage_bps`
+    - `strategy_config` (optional rule-engine config)
     - `context_limit` (optional, default `20`)
   - Response includes:
-    - `decision` (score, confidence, suggested position, stop/take-profit prices)
+    - `decision` (score, confidence, rule scores, debounce/cooldown controls, suggested position, stop/take-profit prices)
     - `prediction`
     - `market_context`
 
@@ -157,9 +167,10 @@ The Flask API can now include Rust-generated context in prediction responses.
     - `lookback_days` (optional)
     - `backtest_days` (optional, default `120`)
     - `starting_cash` (optional, default `10000`)
-    - `max_position_pct`, `stop_loss_pct`, `take_profit_pct`, `fee_bps` (optional)
+    - risk controls: `max_position_pct`, `risk_per_trade_pct`, `max_loss_per_trade_pct`, `stop_loss_pct`, `take_profit_pct`, `max_drawdown_cutoff_pct`
+    - execution model: `fee_bps`, `slippage_bps`, `latency_bars`, `partial_fill_ratio`, `order_type` (`market` / `limit`)
   - Response includes:
-    - `ending_equity`, `total_return_pct`, `max_drawdown_pct`, `win_rate_pct`, and recent `trades`
+    - `ending_equity`, `total_return_pct`, `cagr_pct`, `max_drawdown_pct`, `sharpe`, `sortino`, `win_rate_pct`, `avg_win`, `avg_loss`, and recent `trades`
 
 ### Optional backend environment variables
 
