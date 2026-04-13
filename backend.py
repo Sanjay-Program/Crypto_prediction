@@ -750,6 +750,13 @@ def _clip_unit(x):
     return float(max(-1.0, min(1.0, x)))
 
 
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _estimate_time_bucket(market_context):
     latest_signals = market_context.get("latest_signals", []) if market_context else []
     ts_ms = int(latest_signals[-1].get("signal_ts_ms", 0)) if latest_signals else 0
@@ -769,14 +776,14 @@ def _market_dna_fingerprint(expected_return_pct, forecast_volatility_pct, market
     summary_sources = market_context.get("signal_summary", {}).get("sources", []) if market_context else []
     volume_norm = 0.0
     if latest_features:
-        volumes = [float(f.get("volume", 0.0)) for f in latest_features if float(f.get("volume", 0.0)) > 0.0]
+        volumes = [_safe_float(f.get("volume", 0.0)) for f in latest_features if _safe_float(f.get("volume", 0.0)) > 0.0]
         if volumes:
             v_last = volumes[-1]
             v_avg = max(np.mean(volumes), EPSILON)
             volume_norm = _clip_unit((v_last / v_avg) - 1.0)
 
-    bearish = sum(float(s.get("bearish", s.get("bearish_count", 0))) for s in summary_sources)
-    bullish = sum(float(s.get("bullish", s.get("bullish_count", 0))) for s in summary_sources)
+    bearish = sum(_safe_float(s.get("bearish", s.get("bearish_count", 0))) for s in summary_sources)
+    bullish = sum(_safe_float(s.get("bullish", s.get("bullish_count", 0))) for s in summary_sources)
     sentiment_norm = _clip_unit((bullish - bearish) / max(1.0, bullish + bearish))
     trend_norm = _clip_unit(expected_return_pct / 5.0)
     volatility_norm = _clip_unit((forecast_volatility_pct - 1.0) / 3.0)
@@ -812,8 +819,8 @@ def _detect_whale_activity(market_context):
     if len(latest_features) < 3:
         return {"detected": False, "strength": 0.0, "signal": "none"}
 
-    volumes = [float(f.get("volume", 0.0)) for f in latest_features]
-    momentum = float(latest_features[-1].get("momentum", 0.0))
+    volumes = [_safe_float(f.get("volume", 0.0)) for f in latest_features]
+    momentum = _safe_float(latest_features[-1].get("momentum", 0.0))
     baseline = max(np.mean(volumes[:-1]), EPSILON)
     spike = volumes[-1] / baseline
     strength = float(max(0.0, min(1.0, (spike - 1.0) / 2.0)))
@@ -845,7 +852,7 @@ def _simulate_news_impact(market_context):
 def _detect_macro_shock(market_context, forecast_volatility_pct):
     news_risk = abs(_news_risk_score(market_context))
     summary_sources = market_context.get("signal_summary", {}).get("sources", []) if market_context else []
-    total_signals = float(sum(float(s.get("total", s.get("total_signals", 0))) for s in summary_sources))
+    total_signals = float(sum(_safe_float(s.get("total", s.get("total_signals", 0))) for s in summary_sources))
     signal_pressure = min(1.0, total_signals / 30.0)
     vol_pressure = min(1.0, forecast_volatility_pct / 4.0)
     shock_score = float(min(1.0, (0.5 * news_risk) + (0.3 * vol_pressure) + (0.2 * signal_pressure)))
@@ -1037,8 +1044,8 @@ def generate_auto_trade_decision(
         strategy_config=strategy_config,
     )
 
-    fee_pct = fee_bps / 100.0
-    slippage_pct = slippage_bps / 100.0
+    fee_pct = fee_bps / 10000.0
+    slippage_pct = slippage_bps / 10000.0
     forecast_volatility_pct = _estimate_forecast_volatility_pct(predictions)
     market_dna = _market_dna_fingerprint(expected_return_pct, forecast_volatility_pct, market_context)
     whale_signal = _detect_whale_activity(market_context)

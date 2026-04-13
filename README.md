@@ -204,3 +204,33 @@ The Flask API can now include Rust-generated context in prediction responses.
 - `AURA_MARKET_FEATURES_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_features.pb`)
 - `AURA_MARKET_SIGNALS_PATH` (defaults to `aura_x_prime_ingestion/output/aura_market_signals.pb`)
 - `AURA_SIGNAL_SUMMARY_PATH` (defaults to `aura_x_prime_ingestion/output/aura_signal_summary.json`)
+
+## Verification / test workflow
+
+Run end-to-end project checks:
+
+```bash
+cd aura_x_prime_ingestion
+cargo fmt -- --check
+cargo check
+cargo test
+
+cd ..
+python -m py_compile backend.py
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+Local live-smoke API verification:
+
+```bash
+python backend.py
+```
+
+Then in another shell:
+
+```bash
+curl -s http://127.0.0.1:5000/health
+curl -s -X POST http://127.0.0.1:5000/trade/auto/intelligence -H "Content-Type: application/json" -d '{"symbol":"BTC-USD"}'
+curl -s -X POST http://127.0.0.1:5000/trade/auto/decision -H "Content-Type: application/json" -d '{"symbol":"BTC-USD"}'
+curl -s "http://127.0.0.1:5000/trade/auto/performance?symbol=BTC-USD&limit=20"
+```
