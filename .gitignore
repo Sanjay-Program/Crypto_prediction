@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+
+aura_x_prime_ingestion/target/
