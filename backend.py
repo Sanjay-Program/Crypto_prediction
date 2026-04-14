@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import numpy as np
 import pandas as pd
@@ -1391,6 +1391,9 @@ def run_paper_backtest(
 # Root route
 @app.route('/')
 def home():
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.exists(index_path):
+        return send_file(index_path)
     return "Welcome to the Cryptocurrency Price Predictor API!"
 
 

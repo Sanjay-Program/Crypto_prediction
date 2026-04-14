@@ -3,92 +3,159 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cryptocurrency Price Predictor</title>
+  <title>Crypto/Stock Prediction Dashboard</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body {
-      font-family: Arial, sans-serif;
-      padding: 20px;
-      background-color: #f4f4f9;
-    }
-    h1 {
-      color: #333;
-    }
-    input, button {
-      padding: 10px;
-      margin: 10px 0;
-      font-size: 16px;
-    }
-    button {
-      cursor: pointer;
-      background-color: #4caf50;
-      color: white;
-      border: none;
-      border-radius: 5px;
-    }
-    canvas {
-      max-width: 100%;
-      height: 400px;
-    }
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; margin: 0; background: #f4f6fb; color: #1f2937; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 20px; }
+    .card { background: #fff; border-radius: 10px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    h1, h2 { margin: 0 0 12px 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 10px; }
+    input, select, button { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #d1d5db; font-size: 14px; }
+    button { background: #2563eb; color: #fff; border: none; cursor: pointer; font-weight: 600; }
+    button:hover { background: #1d4ed8; }
+    .btn-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px,1fr)); gap: 10px; margin-top: 10px; }
+    pre { background: #0f172a; color: #f8fafc; padding: 12px; border-radius: 8px; overflow-x: auto; max-height: 360px; }
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #e2e8f0; font-size: 12px; margin-right: 8px; }
+    .warn { color: #b91c1c; font-weight: 600; }
+    canvas { width: 100%; max-height: 360px; }
   </style>
 </head>
 <body>
-  <h1>Cryptocurrency Price Predictor</h1>
-  <input type="text" id="crypto-symbol" placeholder="Enter Crypto Symbol (e.g., BTC-USD)">
-  <button onclick="fetchCryptoPredictions()">Predict Prices</button>
+  <div class="container">
+    <div class="card">
+      <h1>Crypto / Stock Prediction Dashboard</h1>
+      <p class="warn">Important: No model can guarantee 100% accurate market prediction or guaranteed profit.</p>
+      <span class="badge" id="healthBadge">Health: checking...</span>
+      <span class="badge" id="modelCacheBadge">Model cache: -</span>
+    </div>
 
-  <canvas id="cryptoChart"></canvas>
+    <div class="card">
+      <h2>Inputs</h2>
+      <div class="grid">
+        <div><label>Symbol</label><input id="symbol" value="BTC-USD"></div>
+        <div><label>Lookback Days</label><input id="lookback_days" type="number" value="365" min="90" max="3650"></div>
+        <div><label>Horizon Days</label><input id="horizon_days" type="number" value="7" min="1" max="60"></div>
+        <div><label>Backtest Days</label><input id="backtest_days" type="number" value="120" min="30" max="1000"></div>
+      </div>
+      <div class="btn-row">
+        <button onclick="runPrediction()">Predict</button>
+        <button onclick="runIntelligence()">Intelligence</button>
+        <button onclick="runDecision()">Decision</button>
+        <button onclick="runBacktest()">Backtest</button>
+        <button onclick="loadPerformance()">Performance</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Prediction Chart</h2>
+      <canvas id="predictionChart"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Response</h2>
+      <pre id="output">{}</pre>
+    </div>
+  </div>
 
   <script>
-    async function fetchCryptoPredictions() {
-      const symbol = document.getElementById("crypto-symbol").value;
-      if (!symbol) {
-        alert("Please enter a cryptocurrency symbol.");
-        return;
-      }
+    let chartRef = null;
+    const outputEl = document.getElementById("output");
 
+    function getBasePayload() {
+      return {
+        symbol: document.getElementById("symbol").value.trim() || "BTC-USD",
+        lookback_days: Number(document.getElementById("lookback_days").value) || 365,
+        horizon_days: Number(document.getElementById("horizon_days").value) || 7
+      };
+    }
+
+    function setOutput(data) {
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function callApi(path, payload, method = "POST") {
+      const init = { method, headers: { "Content-Type": "application/json" } };
+      if (method !== "GET") init.body = JSON.stringify(payload || {});
+      const response = await fetch(path, init);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Request failed: ${response.status}`);
+      return data;
+    }
+
+    function drawPredictionChart(predictions, bands) {
+      const labels = predictions.map((_, i) => `Day ${i + 1}`);
+      const lower = bands?.map(b => b.low) || [];
+      const upper = bands?.map(b => b.high) || [];
+      const ctx = document.getElementById("predictionChart").getContext("2d");
+      if (chartRef) chartRef.destroy();
+      chartRef = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Prediction", data: predictions, borderColor: "#2563eb", tension: 0.2 },
+            { label: "Lower Band", data: lower, borderColor: "#f59e0b", borderDash: [6, 4], tension: 0.2 },
+            { label: "Upper Band", data: upper, borderColor: "#16a34a", borderDash: [6, 4], tension: 0.2 }
+          ]
+        },
+        options: { responsive: true, maintainAspectRatio: false }
+      });
+    }
+
+    async function refreshHealth() {
       try {
-        const response = await fetch("http://127.0.0.1:5000/predict/crypto", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ symbol: symbol })
-        });
-
-        if (!response.ok) {
-          throw new Error("Failed to fetch predictions.");
-        }
-
-        const data = await response.json();
-        const predictions = data.predictions;
-
-        // Plot predictions on the chart
-        const ctx = document.getElementById("cryptoChart").getContext("2d");
-        new Chart(ctx, {
-          type: "line",
-          data: {
-            labels: predictions.map((_, index) => `Day ${index + 1}`),
-            datasets: [{
-              label: "Predicted Prices",
-              data: predictions,
-              borderColor: "#4caf50",
-              borderWidth: 2,
-              fill: false
-            }]
-          },
-          options: {
-            responsive: true,
-            scales: {
-              x: { display: true, title: { display: true, text: "Days" } },
-              y: { display: true, title: { display: true, text: "Price (USD)" } }
-            }
-          }
-        });
-      } catch (error) {
-        console.error("Error fetching predictions:", error);
+        const data = await callApi("/health", null, "GET");
+        document.getElementById("healthBadge").textContent = `Health: ${data.status || "unknown"}`;
+        document.getElementById("modelCacheBadge").textContent = `Model cache: ${data.model_cache_size ?? "-"}`;
+      } catch {
+        document.getElementById("healthBadge").textContent = "Health: unavailable";
       }
     }
+
+    async function runPrediction() {
+      try {
+        const payload = { ...getBasePayload(), include_market_context: true };
+        const data = await callApi("/predict/crypto", payload);
+        drawPredictionChart(data.predictions || [], data.confidence_bands || []);
+        setOutput(data);
+      } catch (err) { setOutput({ error: err.message }); }
+    }
+
+    async function runIntelligence() {
+      try {
+        const data = await callApi("/trade/auto/intelligence", getBasePayload());
+        setOutput(data);
+      } catch (err) { setOutput({ error: err.message }); }
+    }
+
+    async function runDecision() {
+      try {
+        const data = await callApi("/trade/auto/decision", getBasePayload());
+        setOutput(data);
+      } catch (err) { setOutput({ error: err.message }); }
+    }
+
+    async function runBacktest() {
+      try {
+        const payload = { ...getBasePayload(), backtest_days: Number(document.getElementById("backtest_days").value) || 120 };
+        const data = await callApi("/trade/auto/backtest", payload);
+        setOutput(data);
+      } catch (err) { setOutput({ error: err.message }); }
+    }
+
+    async function loadPerformance() {
+      const symbol = encodeURIComponent((document.getElementById("symbol").value || "BTC-USD").trim());
+      try {
+        const res = await fetch(`/trade/auto/performance?symbol=${symbol}&limit=100`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
+        setOutput(data);
+      } catch (err) { setOutput({ error: err.message }); }
+    }
+
+    refreshHealth();
   </script>
 </body>
 </html>
